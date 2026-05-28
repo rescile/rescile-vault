@@ -47,7 +47,7 @@ build-static:
     export RESCILE_RELEASE_CHANNEL="developer-build"
 
     echo "    -> Building static '{{name}}' (developer build for x86_64-unknown-linux-musl)..."
-    cargo build --release --target x86_64-unknown-linux-gnu --features openssl-vendored,tpm
+    cargo build --release --target x86_64-unknown-linux-musl --features openssl-vendored
     echo "==> Developer build complete. Version reverted in Cargo.toml."
     echo "    Binary is available at: {{static_out_dir}}/{{name}}"
 

@@ -1,0 +1,251 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to (re)build assets for (e.g. v0.1.0)'
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: '0'
+
+jobs:
+  build:
+    name: Build ${{ matrix.name }}
+    # Pinned to 22.04 so the gnu-tpm binary's glibc floor is 2.35, giving us
+    # broader distro compatibility than the latest runner image.
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Fully static, no system runtime deps. Built with Zig as the linker
+          # so OpenSSL/etc. can be statically linked against musl.
+          - name: x86_64-linux-musl
+            target: x86_64-unknown-linux-musl
+            features: openssl-vendored
+            build_tool: zigbuild
+            build_tpm2_tss_static: false
+
+          # glibc target. tpm2-tss is built from source as a static archive so
+          # the resulting binary does not depend on a system-installed
+          # libtss2-*.so. Only glibc itself remains dynamically linked.
+          - name: x86_64-linux-gnu-tpm
+            target: x86_64-unknown-linux-gnu
+            features: openssl-vendored,tpm
+            build_tool: cargo
+            build_tpm2_tss_static: true
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve tag
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="${{ github.event.inputs.tag }}"
+          else
+            TAG="${GITHUB_REF#refs/tags/}"
+          fi
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "Building tag: ${TAG}"
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup target add ${{ matrix.target }}
+          rustup default stable
+
+      - name: Cache cargo registry & build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-${{ matrix.target }}-${{ matrix.features }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            cargo-${{ runner.os }}-${{ matrix.target }}-${{ matrix.features }}-
+            cargo-${{ runner.os }}-${{ matrix.target }}-
+
+      - name: Install Zig
+        if: matrix.build_tool == 'zigbuild'
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.13.0
+
+      - name: Install cargo-zigbuild
+        if: matrix.build_tool == 'zigbuild'
+        run: cargo install cargo-zigbuild --locked --version '^0.19'
+
+      # ------------------------------------------------------------------
+      # tpm2-tss: build from source as a static archive so the final binary
+      # has no runtime dependency on libtss2-*.so.
+      # ------------------------------------------------------------------
+      - name: Install tpm2-tss build prerequisites
+        if: matrix.build_tpm2_tss_static
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            autoconf-archive automake libtool m4 pkg-config \
+            libssl-dev libjson-c-dev libclang-dev
+
+      - name: Cache static tpm2-tss
+        if: matrix.build_tpm2_tss_static
+        id: cache-tpm2-tss
+        uses: actions/cache@v4
+        with:
+          path: /opt/tpm2-tss
+          key: tpm2-tss-static-4.1.3-${{ runner.os }}-v1
+
+      - name: Build static tpm2-tss
+        if: matrix.build_tpm2_tss_static && steps.cache-tpm2-tss.outputs.cache-hit != 'true'
+        run: |
+          TPM2_TSS_VERSION=4.1.3
+          curl -fsSL -o /tmp/tpm2-tss.tar.gz \
+            "https://github.com/tpm2-software/tpm2-tss/releases/download/${TPM2_TSS_VERSION}/tpm2-tss-${TPM2_TSS_VERSION}.tar.gz"
+          mkdir -p /tmp/src/tpm2-tss
+          tar -xzf /tmp/tpm2-tss.tar.gz -C /tmp/src/tpm2-tss --strip-components=1
+          cd /tmp/src/tpm2-tss
+          ./configure \
+            --prefix=/opt/tpm2-tss \
+            --disable-shared \
+            --enable-static \
+            --disable-fapi \
+            --disable-policy \
+            --disable-doxygen-doc \
+            --with-pic
+          make -j"$(nproc)"
+          make install
+
+      - name: Install static tpm2-tss into PKG_CONFIG_PATH
+        if: matrix.build_tpm2_tss_static
+        run: |
+          echo "PKG_CONFIG_PATH=/opt/tpm2-tss/lib/pkgconfig:${PKG_CONFIG_PATH:-}" >> "$GITHUB_ENV"
+          # Tell pkg-config to emit transitive private deps so static linking
+          # resolves everything (json-c, crypto, etc.).
+          echo "PKG_CONFIG_ALL_STATIC=1" >> "$GITHUB_ENV"
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: ui/package-lock.json
+
+      - name: Build frontend
+        working-directory: ui
+        run: |
+          npm ci
+          npm run build
+
+      - name: Build binary (zigbuild / musl)
+        if: matrix.build_tool == 'zigbuild'
+        env:
+          SKIP_FRONTEND_BUILD: '1'
+        run: |
+          cargo zigbuild \
+            --release \
+            --locked \
+            --target ${{ matrix.target }} \
+            --features ${{ matrix.features }}
+
+      - name: Build binary (native / gnu)
+        if: matrix.build_tool == 'cargo'
+        env:
+          SKIP_FRONTEND_BUILD: '1'
+        run: |
+          cargo build \
+            --release \
+            --locked \
+            --target ${{ matrix.target }} \
+            --features ${{ matrix.features }}
+
+      - name: Strip binary
+        run: |
+          strip "target/${{ matrix.target }}/release/rescile-vault"
+
+      - name: Verify binary
+        run: |
+          file "target/${{ matrix.target }}/release/rescile-vault"
+          # Make sure the gnu-tpm build did not end up linked to a system
+          # libtss2 — only glibc-ish dynamic deps should remain.
+          if [ "${{ matrix.build_tpm2_tss_static }}" = "true" ]; then
+            if ldd "target/${{ matrix.target }}/release/rescile-vault" | grep -q 'libtss2'; then
+              echo "::error::Binary links dynamically against libtss2 — static tpm2-tss linkage failed"
+              ldd "target/${{ matrix.target }}/release/rescile-vault"
+              exit 1
+            fi
+            echo "Dynamic deps:"
+            ldd "target/${{ matrix.target }}/release/rescile-vault"
+          fi
+          "target/${{ matrix.target }}/release/rescile-vault" --version
+
+      - name: Package asset
+        id: pkg
+        run: |
+          mkdir -p dist
+          ASSET="rescile-vault-${{ steps.tag.outputs.tag }}-${{ matrix.name }}"
+          cp "target/${{ matrix.target }}/release/rescile-vault" "dist/${ASSET}"
+          ( cd dist && sha256sum "${ASSET}" > "${ASSET}.sha256" )
+          echo "asset=${ASSET}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Publish release assets
+    needs: build
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - name: Resolve tag
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="${{ github.event.inputs.tag }}"
+          else
+            TAG="${GITHUB_REF#refs/tags/}"
+          fi
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Build combined checksums.txt
+        working-directory: artifacts
+        run: |
+          # Combine per-asset .sha256 files into a single checksums.txt in the
+          # format `just publish-release` expects: "<sha256>  <asset_name>".
+          cat *.sha256 | sort -k2 > checksums.txt
+          rm -f *.sha256
+          echo "--- checksums.txt ---"
+          cat checksums.txt
+
+      - name: Upload assets to release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          files: |
+            artifacts/*
+          fail_on_unmatched_files: true
+          # If `just mark-release` already created the release with notes,
+          # this action just appends the assets and leaves the body alone.

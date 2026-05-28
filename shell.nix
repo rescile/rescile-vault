@@ -73,6 +73,10 @@ pkgs.mkShell {
     pkgs.zig # For static compilation
     pkgs.pkg-config
     pkgs.tpm2-tss
+    # tpm2-tss has split outputs (out/man/dev); only "out" and "man" are in
+    # outputsToInstall by default, so the dev output (which carries tss2-*.pc
+    # files) needs to be listed explicitly for pkg-config to find them.
+    pkgs.tpm2-tss.dev
     pkgs.openssl
     pkgs.python3
     pkgs.nodejs

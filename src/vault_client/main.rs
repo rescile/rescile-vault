@@ -7,10 +7,16 @@ use base64::Engine;
 use clap::{Parser, Subcommand};
 use rand::RngCore;
 use reqwest::blocking::Client;
+use rust_embed::RustEmbed;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::error::Error;
+use tiny_http::{Header, Method, Response, Server};
 use x25519_dalek::{EphemeralSecret, PublicKey, StaticSecret};
+
+#[derive(RustEmbed)]
+#[folder = "ui/dist/"]
+struct Asset;
 
 #[cfg(feature = "tpm")]
 mod tpm;
@@ -66,6 +72,8 @@ enum Commands {
     },
     /// Run a batch of commands from a file
     Batch { file: std::path::PathBuf },
+    /// Start the Web UI
+    Ui,
 }
 
 #[derive(Subcommand, Debug, Clone)]
@@ -803,12 +811,12 @@ impl VaultContext {
         Ok(())
     }
 
-    fn invite_client(
+    fn api_invite_client(
         &mut self,
         collection_name: &str,
         target_client: &str,
         validity: Option<String>,
-    ) -> Result<(), Box<dyn Error>> {
+    ) -> Result<String, Box<dyn Error>> {
         let mut state = self.get_state()?;
         let collection_key = self.resolve_collection_key(collection_name, &mut state)?;
 
@@ -842,7 +850,17 @@ impl VaultContext {
             return Err(format!("Failed to invite client: {}", resp.text()?).into());
         }
 
-        println!("{}", B64URL.encode(&invite_secret));
+        Ok(token_b64)
+    }
+
+    fn invite_client(
+        &mut self,
+        collection_name: &str,
+        target_client: &str,
+        validity: Option<String>,
+    ) -> Result<(), Box<dyn Error>> {
+        let token = self.api_invite_client(collection_name, target_client, validity)?;
+        println!("{}", token);
         Ok(())
     }
 
@@ -1047,8 +1065,664 @@ impl VaultContext {
         Ok(())
     }
 
+    fn api_get_secret(
+        &mut self,
+        collection: &str,
+        secret_name: &str,
+    ) -> Result<(String, bool), Box<dyn Error>> {
+        let mut state = self.get_state()?;
+        let collection_key = self.resolve_collection_key(collection, &mut state)?;
+
+        let session = self.session.as_ref().unwrap();
+        let name_salt = B64URL.decode(&session.name_salt).unwrap();
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(collection.as_bytes());
+        hasher.update(secret_name.as_bytes());
+        hasher.update(&name_salt);
+        let id = hasher.finalize().to_string();
+
+        if let Some(cipher) = state.ciphers.iter().find(|c| c.id == id) {
+            let pt = decrypt_cipher_blob(&cipher.blob, &collection_key)
+                .ok_or("Failed to decrypt cipher")?;
+            let value = String::from_utf8_lossy(&pt).trim_end().to_string();
+            return Ok((value, false));
+        }
+
+        let new_password = generate_random_password(32);
+        let new_blob = encrypt_cipher_blob(new_password.as_bytes(), &collection_key);
+
+        let put_resp = self
+            .client
+            .put(format!("{}/vault/v1/cipher/{}", self.base_url, id))
+            .bearer_auth(&session.token)
+            .json(&serde_json::json!({
+                "collection_id": collection,
+                "blob": new_blob,
+                "updated_at": std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64
+            }))
+            .send()?;
+
+        if !put_resp.status().is_success() {
+            return Err(format!("Failed to save new cipher: {}", put_resp.text()?).into());
+        }
+
+        Ok((new_password, true))
+    }
+
+    fn api_put_secret(
+        &mut self,
+        collection: &str,
+        secret_name: &str,
+        secret_value: Option<String>,
+    ) -> Result<(String, bool), Box<dyn Error>> {
+        let mut state = self.get_state()?;
+        let collection_key = self.resolve_collection_key(collection, &mut state)?;
+
+        let session = self.session.as_ref().unwrap();
+        let name_salt = B64URL.decode(&session.name_salt).unwrap();
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(collection.as_bytes());
+        hasher.update(secret_name.as_bytes());
+        hasher.update(&name_salt);
+        let id = hasher.finalize().to_string();
+
+        let (final_value, generated) = match secret_value {
+            Some(v) if !v.is_empty() => (v, false),
+            _ => (generate_random_password(32), true),
+        };
+
+        let new_blob = encrypt_cipher_blob(final_value.as_bytes(), &collection_key);
+
+        let put_resp = self
+            .client
+            .put(format!("{}/vault/v1/cipher/{}", self.base_url, id))
+            .bearer_auth(&session.token)
+            .json(&serde_json::json!({
+                "collection_id": collection,
+                "blob": new_blob,
+                "updated_at": std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64
+            }))
+            .send()?;
+
+        if !put_resp.status().is_success() {
+            return Err(format!("Failed to save cipher: {}", put_resp.text()?).into());
+        }
+
+        Ok((final_value, generated))
+    }
+
+    fn api_batch(
+        &mut self,
+        collection: &str,
+        create_if_missing: bool,
+        secrets: &[(String, Option<String>)],
+        invites: &[(String, Option<String>)],
+    ) -> Result<serde_json::Value, Box<dyn Error>> {
+        let state = self.get_state()?;
+        let collection_existed = state
+            .collections
+            .iter()
+            .any(|c| c.collection_id == collection);
+
+        let mut collection_created = false;
+        if !collection_existed {
+            if !create_if_missing {
+                return Err(format!("Collection '{}' does not exist", collection).into());
+            }
+            self.create_collection(collection)?;
+            collection_created = true;
+        }
+
+        // Precompute existence of each requested secret to classify the per-item status.
+        let state = self.get_state()?;
+        let name_salt =
+            B64URL.decode(&self.session.as_ref().unwrap().name_salt).unwrap();
+        let secret_exists: Vec<bool> = secrets
+            .iter()
+            .map(|(name, _)| {
+                if name.is_empty() {
+                    return false;
+                }
+                let mut hasher = blake3::Hasher::new();
+                hasher.update(collection.as_bytes());
+                hasher.update(name.as_bytes());
+                hasher.update(&name_salt);
+                let id = hasher.finalize().to_string();
+                state.ciphers.iter().any(|c| c.id == id)
+            })
+            .collect();
+        drop(state);
+
+        let mut secret_results: Vec<serde_json::Value> = Vec::with_capacity(secrets.len());
+        for ((name, value), existed) in secrets.iter().zip(secret_exists.iter()) {
+            if name.is_empty() {
+                secret_results.push(serde_json::json!({
+                    "name": name,
+                    "status": "error",
+                    "error": "missing name",
+                }));
+                continue;
+            }
+            let supplied = value.as_deref().map(|v| !v.is_empty()).unwrap_or(false);
+            if supplied {
+                match self.api_put_secret(collection, name, value.clone()) {
+                    Ok(_) => secret_results.push(serde_json::json!({
+                        "name": name,
+                        "status": if *existed { "updated" } else { "created" },
+                        "generated": false,
+                    })),
+                    Err(e) => secret_results.push(serde_json::json!({
+                        "name": name,
+                        "status": "error",
+                        "error": format!("{}", e),
+                    })),
+                }
+            } else if *existed {
+                secret_results.push(serde_json::json!({
+                    "name": name,
+                    "status": "kept",
+                    "generated": false,
+                }));
+            } else {
+                match self.api_put_secret(collection, name, None) {
+                    Ok((generated_value, _)) => secret_results.push(serde_json::json!({
+                        "name": name,
+                        "status": "created",
+                        "generated": true,
+                        "value": generated_value,
+                    })),
+                    Err(e) => secret_results.push(serde_json::json!({
+                        "name": name,
+                        "status": "error",
+                        "error": format!("{}", e),
+                    })),
+                }
+            }
+        }
+
+        let mut invite_results: Vec<serde_json::Value> = Vec::with_capacity(invites.len());
+        for (client, validity) in invites {
+            if client.is_empty() {
+                invite_results.push(serde_json::json!({
+                    "client": client,
+                    "status": "error",
+                    "error": "missing client",
+                }));
+                continue;
+            }
+            match self.api_invite_client(collection, client, validity.clone()) {
+                Ok(token) => invite_results.push(serde_json::json!({
+                    "client": client,
+                    "status": "invited",
+                    "token": token,
+                })),
+                Err(e) => invite_results.push(serde_json::json!({
+                    "client": client,
+                    "status": "error",
+                    "error": format!("{}", e),
+                })),
+            }
+        }
+
+        Ok(serde_json::json!({
+            "collection": collection,
+            "collection_created": collection_created,
+            "collection_existed": collection_existed,
+            "secrets": secret_results,
+            "invites": invite_results,
+        }))
+    }
+
+    fn cmd_ui(&self) -> Result<(), Box<dyn Error>> {
+        use std::sync::Mutex;
+
+        let initial_url = self.cli.url.clone();
+        let initial_clientname = self.clientname.clone();
+        let initial_password = self.password.clone();
+        let url_set = std::env::var("RESCILE_VAULT_URL").is_ok();
+        let clientname_set = self.cli.clientname.is_some();
+        let password_set = self.cli.password.is_some();
+        let tpm_flag = self.cli.tpm;
+        let credentials_provided = (password_set || tpm_flag) && clientname_set;
+
+        let ctx_lock: Mutex<Option<VaultContext>> = Mutex::new(None);
+
+        if credentials_provided {
+            let auto_cli = Cli {
+                url: initial_url.clone(),
+                clientname: Some(initial_clientname.clone()),
+                password: initial_password.clone(),
+                tpm: tpm_flag,
+                command: Commands::Ui,
+            };
+            let mut ctx = VaultContext::new(auto_cli);
+            if ctx.authenticate().is_ok() {
+                *ctx_lock.lock().unwrap() = Some(ctx);
+            }
+        }
+
+        let server = Server::http("127.0.0.1:0").unwrap();
+        let port = server.server_addr().to_ip().unwrap().port();
+        println!("Web UI started at http://127.0.0.1:{}", port);
+
+        let json_response = |status: u16, value: serde_json::Value| {
+            let body = serde_json::to_vec(&value).unwrap();
+            Response::from_data(body).with_status_code(status).with_header(
+                Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).unwrap(),
+            )
+        };
+
+        for mut request in server.incoming_requests() {
+            let full_url = request.url().to_string();
+            let method = request.method().clone();
+            let path_only = full_url.split('?').next().unwrap_or("/").to_string();
+
+            if path_only.starts_with("/api/") {
+                let mut body_str = String::new();
+                if matches!(method, Method::Post | Method::Put) {
+                    let _ = request.as_reader().read_to_string(&mut body_str);
+                }
+                let body: serde_json::Value = if body_str.is_empty() {
+                    serde_json::Value::Null
+                } else {
+                    match serde_json::from_str(&body_str) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            let _ = request.respond(json_response(
+                                400,
+                                serde_json::json!({"error": format!("Invalid JSON: {}", e)}),
+                            ));
+                            continue;
+                        }
+                    }
+                };
+
+                let str_field = |key: &str| -> Option<String> {
+                    body.get(key).and_then(|v| v.as_str()).map(String::from)
+                };
+
+                match (&method, path_only.as_str()) {
+                    (Method::Get, "/api/config") => {
+                        let guard = ctx_lock.lock().unwrap();
+                        let (ready, current_clientname, current_url) = match guard.as_ref() {
+                            Some(ctx) => (true, ctx.clientname.clone(), ctx.base_url.clone()),
+                            None => (false, initial_clientname.clone(), initial_url.clone()),
+                        };
+                        drop(guard);
+                        let value = serde_json::json!({
+                            "url": current_url,
+                            "clientname": current_clientname,
+                            "has_url": url_set,
+                            "has_clientname": clientname_set,
+                            "has_password": password_set || tpm_flag,
+                            "ready": ready,
+                        });
+                        let _ = request.respond(json_response(200, value));
+                    }
+                    (Method::Post, "/api/login") => {
+                        let url = str_field("url").unwrap_or_else(|| initial_url.clone());
+                        let clientname =
+                            str_field("clientname").unwrap_or_else(|| initial_clientname.clone());
+                        let password = str_field("password").or_else(|| initial_password.clone());
+
+                        if !tpm_flag
+                            && password.as_deref().map(|p| p.is_empty()).unwrap_or(true)
+                        {
+                            let _ = request.respond(json_response(
+                                400,
+                                serde_json::json!({"error": "Password is required"}),
+                            ));
+                            continue;
+                        }
+
+                        let cli_for_login = Cli {
+                            url,
+                            clientname: Some(clientname),
+                            password,
+                            tpm: tpm_flag,
+                            command: Commands::Ui,
+                        };
+                        let mut ctx = VaultContext::new(cli_for_login);
+                        match ctx.authenticate() {
+                            Ok(_) => {
+                                *ctx_lock.lock().unwrap() = Some(ctx);
+                                let _ = request
+                                    .respond(json_response(200, serde_json::json!({"ok": true})));
+                            }
+                            Err(e) => {
+                                let _ = request.respond(json_response(
+                                    401,
+                                    serde_json::json!({"error": format!("{}", e)}),
+                                ));
+                            }
+                        }
+                    }
+                    (Method::Post, "/api/logout") => {
+                        *ctx_lock.lock().unwrap() = None;
+                        let _ = request
+                            .respond(json_response(200, serde_json::json!({"ok": true})));
+                    }
+                    (Method::Get, "/api/state") => {
+                        let mut guard = ctx_lock.lock().unwrap();
+                        match guard.as_mut() {
+                            None => {
+                                let _ = request.respond(json_response(
+                                    401,
+                                    serde_json::json!({"error": "Not authenticated"}),
+                                ));
+                            }
+                            Some(ctx) => match ctx.get_state() {
+                                Ok(state) => {
+                                    let clientname = ctx.clientname.clone();
+                                    let collections: Vec<serde_json::Value> = state
+                                        .collections
+                                        .iter()
+                                        .filter(|c| {
+                                            c.client_access.contains_key(&clientname)
+                                                || c.pending_invites.contains_key(&clientname)
+                                        })
+                                        .map(|c| {
+                                            let mut members: Vec<&String> =
+                                                c.client_access.keys().collect();
+                                            members.sort();
+                                            let mut pending_invitees: Vec<&String> =
+                                                c.pending_invites.keys().collect();
+                                            pending_invitees.sort();
+                                            serde_json::json!({
+                                                "name": c.collection_id,
+                                                "has_access": c.client_access.contains_key(&clientname),
+                                                "pending_invite": c.pending_invites.contains_key(&clientname),
+                                                "members": members,
+                                                "pending_invitees": pending_invitees,
+                                            })
+                                        })
+                                        .collect();
+                                    let _ = request.respond(json_response(
+                                        200,
+                                        serde_json::json!({
+                                            "clientname": clientname,
+                                            "collections": collections,
+                                        }),
+                                    ));
+                                }
+                                Err(e) => {
+                                    let _ = request.respond(json_response(
+                                        500,
+                                        serde_json::json!({"error": format!("{}", e)}),
+                                    ));
+                                }
+                            },
+                        }
+                    }
+                    (Method::Post, "/api/collection") => {
+                        let name = str_field("name").unwrap_or_default();
+                        if name.is_empty() {
+                            let _ = request.respond(json_response(
+                                400,
+                                serde_json::json!({"error": "Collection name is required"}),
+                            ));
+                            continue;
+                        }
+                        let mut guard = ctx_lock.lock().unwrap();
+                        match guard.as_mut() {
+                            None => {
+                                let _ = request.respond(json_response(
+                                    401,
+                                    serde_json::json!({"error": "Not authenticated"}),
+                                ));
+                            }
+                            Some(ctx) => match ctx.create_collection(&name) {
+                                Ok(_) => {
+                                    let _ = request.respond(json_response(
+                                        200,
+                                        serde_json::json!({"ok": true}),
+                                    ));
+                                }
+                                Err(e) => {
+                                    let _ = request.respond(json_response(
+                                        400,
+                                        serde_json::json!({"error": format!("{}", e)}),
+                                    ));
+                                }
+                            },
+                        }
+                    }
+                    (Method::Post, "/api/secret/get") => {
+                        let collection = str_field("collection").unwrap_or_default();
+                        let name = str_field("name").unwrap_or_default();
+                        if collection.is_empty() || name.is_empty() {
+                            let _ = request.respond(json_response(
+                                400,
+                                serde_json::json!({"error": "collection and name are required"}),
+                            ));
+                            continue;
+                        }
+                        let mut guard = ctx_lock.lock().unwrap();
+                        match guard.as_mut() {
+                            None => {
+                                let _ = request.respond(json_response(
+                                    401,
+                                    serde_json::json!({"error": "Not authenticated"}),
+                                ));
+                            }
+                            Some(ctx) => match ctx.api_get_secret(&collection, &name) {
+                                Ok((value, generated)) => {
+                                    let _ = request.respond(json_response(
+                                        200,
+                                        serde_json::json!({"value": value, "generated": generated}),
+                                    ));
+                                }
+                                Err(e) => {
+                                    let _ = request.respond(json_response(
+                                        400,
+                                        serde_json::json!({"error": format!("{}", e)}),
+                                    ));
+                                }
+                            },
+                        }
+                    }
+                    (Method::Post, "/api/secret/put") => {
+                        let collection = str_field("collection").unwrap_or_default();
+                        let name = str_field("name").unwrap_or_default();
+                        let value_opt = str_field("value");
+                        if collection.is_empty() || name.is_empty() {
+                            let _ = request.respond(json_response(
+                                400,
+                                serde_json::json!({"error": "collection and name are required"}),
+                            ));
+                            continue;
+                        }
+                        let mut guard = ctx_lock.lock().unwrap();
+                        match guard.as_mut() {
+                            None => {
+                                let _ = request.respond(json_response(
+                                    401,
+                                    serde_json::json!({"error": "Not authenticated"}),
+                                ));
+                            }
+                            Some(ctx) => match ctx.api_put_secret(&collection, &name, value_opt) {
+                                Ok((value, generated)) => {
+                                    let _ = request.respond(json_response(
+                                        200,
+                                        serde_json::json!({"value": value, "generated": generated}),
+                                    ));
+                                }
+                                Err(e) => {
+                                    let _ = request.respond(json_response(
+                                        400,
+                                        serde_json::json!({"error": format!("{}", e)}),
+                                    ));
+                                }
+                            },
+                        }
+                    }
+                    (Method::Post, "/api/batch") => {
+                        let collection = str_field("collection").unwrap_or_default();
+                        if collection.is_empty() {
+                            let _ = request.respond(json_response(
+                                400,
+                                serde_json::json!({"error": "collection is required"}),
+                            ));
+                            continue;
+                        }
+                        let create_if_missing = body
+                            .get("create_if_missing")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(true);
+                        let secrets: Vec<(String, Option<String>)> = body
+                            .get("secrets")
+                            .and_then(|v| v.as_array())
+                            .map(|arr| {
+                                arr.iter()
+                                    .map(|item| {
+                                        let name = item
+                                            .get("name")
+                                            .and_then(|v| v.as_str())
+                                            .unwrap_or("")
+                                            .to_string();
+                                        let value = item
+                                            .get("value")
+                                            .and_then(|v| v.as_str())
+                                            .map(String::from);
+                                        (name, value)
+                                    })
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        let invites: Vec<(String, Option<String>)> = body
+                            .get("invites")
+                            .and_then(|v| v.as_array())
+                            .map(|arr| {
+                                arr.iter()
+                                    .map(|item| {
+                                        let client = item
+                                            .get("client")
+                                            .and_then(|v| v.as_str())
+                                            .unwrap_or("")
+                                            .to_string();
+                                        let validity = item
+                                            .get("validity")
+                                            .and_then(|v| v.as_str())
+                                            .filter(|s| !s.is_empty())
+                                            .map(String::from);
+                                        (client, validity)
+                                    })
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+
+                        let mut guard = ctx_lock.lock().unwrap();
+                        match guard.as_mut() {
+                            None => {
+                                let _ = request.respond(json_response(
+                                    401,
+                                    serde_json::json!({"error": "Not authenticated"}),
+                                ));
+                            }
+                            Some(ctx) => match ctx.api_batch(
+                                &collection,
+                                create_if_missing,
+                                &secrets,
+                                &invites,
+                            ) {
+                                Ok(report) => {
+                                    let _ = request.respond(json_response(200, report));
+                                }
+                                Err(e) => {
+                                    let _ = request.respond(json_response(
+                                        400,
+                                        serde_json::json!({"error": format!("{}", e)}),
+                                    ));
+                                }
+                            },
+                        }
+                    }
+                    (Method::Post, "/api/secret/delete") => {
+                        let collection = str_field("collection").unwrap_or_default();
+                        let name = str_field("name").unwrap_or_default();
+                        if collection.is_empty() || name.is_empty() {
+                            let _ = request.respond(json_response(
+                                400,
+                                serde_json::json!({"error": "collection and name are required"}),
+                            ));
+                            continue;
+                        }
+                        let mut guard = ctx_lock.lock().unwrap();
+                        match guard.as_mut() {
+                            None => {
+                                let _ = request.respond(json_response(
+                                    401,
+                                    serde_json::json!({"error": "Not authenticated"}),
+                                ));
+                            }
+                            Some(ctx) => match ctx.cmd_delete_secret(&collection, &name) {
+                                Ok(_) => {
+                                    let _ = request.respond(json_response(
+                                        200,
+                                        serde_json::json!({"ok": true}),
+                                    ));
+                                }
+                                Err(e) => {
+                                    let _ = request.respond(json_response(
+                                        400,
+                                        serde_json::json!({"error": format!("{}", e)}),
+                                    ));
+                                }
+                            },
+                        }
+                    }
+                    _ => {
+                        let _ = request.respond(json_response(
+                            404,
+                            serde_json::json!({"error": "Not found"}),
+                        ));
+                    }
+                }
+                continue;
+            }
+
+            let path = if path_only == "/" {
+                "index.html"
+            } else {
+                path_only.trim_start_matches('/')
+            };
+
+            match Asset::get(path) {
+                Some(content) => {
+                    let mime = mime_guess::from_path(path).first_or_octet_stream();
+                    let response = Response::from_data(content.data.into_owned()).with_header(
+                        Header::from_bytes(&b"Content-Type"[..], mime.as_ref().as_bytes()).unwrap(),
+                    );
+                    let _ = request.respond(response);
+                }
+                None => {
+                    if let Some(content) = Asset::get("index.html") {
+                        let mime = mime_guess::from_path("index.html").first_or_octet_stream();
+                        let response = Response::from_data(content.data.into_owned()).with_header(
+                            Header::from_bytes(&b"Content-Type"[..], mime.as_ref().as_bytes())
+                                .unwrap(),
+                        );
+                        let _ = request.respond(response);
+                    } else {
+                        let response = Response::from_string("Not Found").with_status_code(404);
+                        let _ = request.respond(response);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn run_command(&mut self, command: Commands) -> Result<(), Box<dyn Error>> {
-        self.authenticate()?;
+        match &command {
+            Commands::Ui => {
+                self.cmd_ui()?;
+                return Ok(());
+            }
+            _ => self.authenticate()?,
+        }
         match command {
             Commands::Secret { action } => match action {
                 SecretCommands::Get {
@@ -1106,6 +1780,9 @@ impl VaultContext {
                     };
                     self.run_command(batch_cli.command)?;
                 }
+            }
+            Commands::Ui => {
+                // Handled above
             }
         }
         Ok(())
