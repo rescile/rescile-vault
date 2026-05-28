@@ -72,10 +72,11 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: cargo-${{ runner.os }}-${{ matrix.target }}-${{ matrix.features }}-${{ hashFiles('**/Cargo.lock') }}
+          # matrix.name uniquely identifies the build variant and (unlike
+          # matrix.features) contains no commas, which cache keys disallow.
+          key: cargo-${{ runner.os }}-${{ matrix.name }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            cargo-${{ runner.os }}-${{ matrix.target }}-${{ matrix.features }}-
-            cargo-${{ runner.os }}-${{ matrix.target }}-
+            cargo-${{ runner.os }}-${{ matrix.name }}-
 
       - name: Install Zig
         if: matrix.build_tool == 'zigbuild'
