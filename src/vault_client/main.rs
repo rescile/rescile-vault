@@ -208,25 +208,29 @@ struct StateResponse {
     collections: Vec<CollectionEntry>,
 }
 
-fn derive_keys(passphrase: &str, kdf: &KdfParams) -> (Vec<u8>, Vec<u8>) {
+fn derive_keys(passphrase: &str, kdf: &KdfParams) -> Result<(Vec<u8>, Vec<u8>), Box<dyn Error>> {
     let mut mk = [0u8; 32];
-    let params =
-        argon2::Params::new(kdf.memory_kib, kdf.iterations, kdf.parallelism, None).unwrap();
+    let params = argon2::Params::new(kdf.memory_kib, kdf.iterations, kdf.parallelism, None)
+        .map_err(|e| format!("Argon2 params error: {}", e))?;
     let argon2 = argon2::Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params);
-    let salt_bytes = B64URL.decode(&kdf.salt).unwrap();
+    let salt_bytes = B64URL.decode(&kdf.salt)?;
     argon2
         .hash_password_into(passphrase.as_bytes(), &salt_bytes, &mut mk)
-        .unwrap();
+        .map_err(|e| format!("Argon2 error: {}", e))?;
 
     let hkdf_auth = hkdf::Hkdf::<sha2::Sha256>::new(None, &mk);
     let mut ak = [0u8; 32];
-    hkdf_auth.expand(b"rescile-vault-auth-v1", &mut ak).unwrap();
+    hkdf_auth
+        .expand(b"rescile-vault-auth-v1", &mut ak)
+        .map_err(|e| format!("HKDF expand error: {}", e))?;
 
     let hkdf_enc = hkdf::Hkdf::<sha2::Sha256>::new(None, &mk);
     let mut kek = [0u8; 32];
-    hkdf_enc.expand(b"rescile-vault-enc-v1", &mut kek).unwrap();
+    hkdf_enc
+        .expand(b"rescile-vault-enc-v1", &mut kek)
+        .map_err(|e| format!("HKDF expand error: {}", e))?;
 
-    (ak.to_vec(), kek.to_vec())
+    Ok((ak.to_vec(), kek.to_vec()))
 }
 
 fn encrypt_blob(pt: &[u8], key: &[u8]) -> AesGcmBlob {
@@ -246,14 +250,14 @@ fn encrypt_blob(pt: &[u8], key: &[u8]) -> AesGcmBlob {
     }
 }
 
-fn decrypt_blob(blob: &AesGcmBlob, key: &[u8]) -> Vec<u8> {
+fn decrypt_blob(blob: &AesGcmBlob, key: &[u8]) -> Result<Vec<u8>, Box<dyn Error>> {
     let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(key));
-    let nonce_bytes = B64URL.decode(&blob.nonce).unwrap();
-    let mut payload = B64URL.decode(&blob.ciphertext).unwrap();
-    payload.extend_from_slice(&B64URL.decode(&blob.tag).unwrap());
+    let nonce_bytes = B64URL.decode(&blob.nonce)?;
+    let mut payload = B64URL.decode(&blob.ciphertext)?;
+    payload.extend_from_slice(&B64URL.decode(&blob.tag)?);
     cipher
         .decrypt(Nonce::from_slice(&nonce_bytes), payload.as_ref())
-        .unwrap()
+        .map_err(|e| format!("Decryption failed: {}", e).into())
 }
 
 fn encrypt_cipher_blob(pt: &[u8], key: &[u8]) -> String {
@@ -299,6 +303,19 @@ fn generate_random_password(len: usize) -> String {
     }
     password.as_mut_slice().shuffle(&mut rng);
     String::from_utf8(password).unwrap()
+}
+
+fn url_encode(input: &str) -> String {
+    input
+        .as_bytes()
+        .iter()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                (*b as char).to_string()
+            }
+            _ => format!("%{:02X}", b),
+        })
+        .collect()
 }
 
 fn split_args(line: &str) -> Vec<String> {
@@ -489,7 +506,7 @@ impl VaultContext {
             kdf_req.json()?
         };
 
-        let (ak, kek) = derive_keys(password, &kdf_params);
+        let (ak, kek) = derive_keys(password, &kdf_params)?;
         Ok((ak, kek, kdf_params))
     }
 
@@ -546,7 +563,7 @@ impl VaultContext {
             }
 
             let session: SessionResponse = session_resp.json()?;
-            let priv_key_bytes = decrypt_blob(&session.encrypted_private_key, &kek);
+            let priv_key_bytes = decrypt_blob(&session.encrypted_private_key, &kek)?;
             let static_secret =
                 StaticSecret::from(<[u8; 32]>::try_from(priv_key_bytes.as_slice()).unwrap());
 
@@ -568,7 +585,7 @@ impl VaultContext {
                 }
             } else {
                 let password = self.password.as_deref().unwrap();
-                derive_keys(password, &kdf_params)
+                derive_keys(password, &kdf_params)?
             };
 
             let session_resp = self
@@ -585,7 +602,7 @@ impl VaultContext {
             }
 
             let session: SessionResponse = session_resp.json()?;
-            let priv_key_bytes = decrypt_blob(&session.encrypted_private_key, &kek);
+            let priv_key_bytes = decrypt_blob(&session.encrypted_private_key, &kek)?;
             let static_secret =
                 StaticSecret::from(<[u8; 32]>::try_from(priv_key_bytes.as_slice()).unwrap());
 
@@ -640,7 +657,7 @@ impl VaultContext {
                     ciphertext: wrapped_key.ciphertext.clone(),
                     tag: wrapped_key.tag.clone(),
                 };
-                let decrypted_ck = decrypt_blob(&wrapped_blob, &wrap_key);
+                let decrypted_ck = decrypt_blob(&wrapped_blob, &wrap_key)?;
                 let mut collection_key = [0u8; 32];
                 collection_key.copy_from_slice(&decrypted_ck);
                 self.collection_keys
@@ -654,7 +671,8 @@ impl VaultContext {
                         .client
                         .get(format!(
                             "{}/vault/v1/invite/{}",
-                            self.base_url, self.clientname
+                            self.base_url,
+                            url_encode(&self.clientname)
                         ))
                         .send()?;
                     if !resp.status().is_success() {
@@ -671,7 +689,7 @@ impl VaultContext {
                 if invite_token.len() != 32 {
                     return Err("Invalid invite token length".into());
                 }
-                let collection_key_vec = decrypt_blob(&invite.blob, &invite_token);
+                let collection_key_vec = decrypt_blob(&invite.blob, &invite_token)?;
                 let mut collection_key = [0u8; 32];
                 collection_key.copy_from_slice(&collection_key_vec);
 
@@ -825,11 +843,36 @@ impl VaultContext {
             None => None,
         };
 
+        let token_resp = self
+            .client
+            .get(format!(
+                "{}/vault/v1/invite/{}",
+                self.base_url,
+                url_encode(target_client)
+            ))
+            .send()?;
+
         let mut invite_secret = [0u8; 32];
-        rand::thread_rng().fill_bytes(&mut invite_secret);
+        let token_b64 = if token_resp.status().is_success() {
+            let text = token_resp.text()?;
+            if let Ok(decoded) = B64URL.decode(&text) {
+                if decoded.len() == 32 {
+                    invite_secret.copy_from_slice(&decoded);
+                    text
+                } else {
+                    rand::thread_rng().fill_bytes(&mut invite_secret);
+                    B64URL.encode(&invite_secret)
+                }
+            } else {
+                rand::thread_rng().fill_bytes(&mut invite_secret);
+                B64URL.encode(&invite_secret)
+            }
+        } else {
+            rand::thread_rng().fill_bytes(&mut invite_secret);
+            B64URL.encode(&invite_secret)
+        };
 
         let blob = encrypt_blob(&collection_key, &invite_secret);
-        let token_b64 = B64URL.encode(&invite_secret);
 
         let resp = self
             .client
@@ -1177,8 +1220,9 @@ impl VaultContext {
 
         // Precompute existence of each requested secret to classify the per-item status.
         let state = self.get_state()?;
-        let name_salt =
-            B64URL.decode(&self.session.as_ref().unwrap().name_salt).unwrap();
+        let name_salt = B64URL
+            .decode(&self.session.as_ref().unwrap().name_salt)
+            .unwrap();
         let secret_exists: Vec<bool> = secrets
             .iter()
             .map(|(name, _)| {
@@ -1309,9 +1353,11 @@ impl VaultContext {
 
         let json_response = |status: u16, value: serde_json::Value| {
             let body = serde_json::to_vec(&value).unwrap();
-            Response::from_data(body).with_status_code(status).with_header(
-                Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).unwrap(),
-            )
+            Response::from_data(body)
+                .with_status_code(status)
+                .with_header(
+                    Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).unwrap(),
+                )
         };
 
         for mut request in server.incoming_requests() {
@@ -1367,9 +1413,7 @@ impl VaultContext {
                             str_field("clientname").unwrap_or_else(|| initial_clientname.clone());
                         let password = str_field("password").or_else(|| initial_password.clone());
 
-                        if !tpm_flag
-                            && password.as_deref().map(|p| p.is_empty()).unwrap_or(true)
-                        {
+                        if !tpm_flag && password.as_deref().map(|p| p.is_empty()).unwrap_or(true) {
                             let _ = request.respond(json_response(
                                 400,
                                 serde_json::json!({"error": "Password is required"}),
@@ -1401,8 +1445,8 @@ impl VaultContext {
                     }
                     (Method::Post, "/api/logout") => {
                         *ctx_lock.lock().unwrap() = None;
-                        let _ = request
-                            .respond(json_response(200, serde_json::json!({"ok": true})));
+                        let _ =
+                            request.respond(json_response(200, serde_json::json!({"ok": true})));
                     }
                     (Method::Get, "/api/state") => {
                         let mut guard = ctx_lock.lock().unwrap();
