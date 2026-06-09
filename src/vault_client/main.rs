@@ -104,6 +104,8 @@ enum CollectionCommands {
         client: String,
         #[arg(long)]
         validity: Option<String>,
+        #[arg(long)]
+        role: Option<String>,
     },
     Delete {
         name: String,
@@ -129,7 +131,14 @@ enum CollectionCommands {
 
 #[derive(Subcommand, Debug, Clone)]
 enum ClientCommands {
-    Delete,
+    Delete {
+        #[arg(long)]
+        client: Option<String>,
+    },
+    Reset {
+        #[arg(long)]
+        client: String,
+    },
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -191,6 +200,9 @@ struct PendingInvite {
     #[allow(dead_code)]
     #[serde(default)]
     expires_at: Option<u64>,
+    #[allow(dead_code)]
+    #[serde(default)]
+    role: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -559,6 +571,59 @@ impl VaultContext {
                 .send()?;
 
             if !session_resp.status().is_success() {
+                let invite_token_b64 =
+                    std::env::var("RESCILE_VAULT_INVITE_TOKEN").unwrap_or_else(|_| String::new());
+                let invite_token_b64 = if invite_token_b64.is_empty() {
+                    let resp = self
+                        .client
+                        .get(format!(
+                            "{}/vault/v1/invite/{}",
+                            self.base_url,
+                            url_encode(&self.clientname)
+                        ))
+                        .send()?;
+                    if resp.status().is_success() {
+                        resp.text()?
+                    } else {
+                        String::new()
+                    }
+                } else {
+                    invite_token_b64
+                };
+
+                if !invite_token_b64.is_empty() {
+                    let mut rng = rand::thread_rng();
+                    let static_secret = StaticSecret::random_from_rng(&mut rng);
+                    let public_key = PublicKey::from(&static_secret);
+                    let encrypted_private_key = encrypt_blob(&static_secret.to_bytes(), &kek);
+
+                    let reset_resp = self
+                        .client
+                        .post(format!(
+                            "{}/vault/v1/client/{}/reset",
+                            self.base_url,
+                            url_encode(&self.clientname)
+                        ))
+                        .json(&serde_json::json!({
+                            "token": invite_token_b64,
+                            "kdf_params": kdf_params,
+                            "auth_key": B64URL.encode(&ak),
+                            "public_key": B64URL.encode(public_key.as_bytes()),
+                            "encrypted_private_key": encrypted_private_key
+                        }))
+                        .send()?;
+
+                    if reset_resp.status().is_success() {
+                        let session_resp = self.client.post(format!("{}/vault/v1/session", self.base_url))
+                            .json(&serde_json::json!({"auth_key": B64URL.encode(&ak), "client_id": self.clientname})).send()?;
+                        if session_resp.status().is_success() {
+                            let session: SessionResponse = session_resp.json()?;
+                            self.session = Some(session);
+                            self.static_secret = Some(static_secret);
+                            return Ok(());
+                        }
+                    }
+                }
                 return Err(format!("Authentication failed: {}", session_resp.text()?).into());
             }
 
@@ -834,6 +899,7 @@ impl VaultContext {
         collection_name: &str,
         target_client: &str,
         validity: Option<String>,
+        role: Option<String>,
     ) -> Result<String, Box<dyn Error>> {
         let mut state = self.get_state()?;
         let collection_key = self.resolve_collection_key(collection_name, &mut state)?;
@@ -886,6 +952,7 @@ impl VaultContext {
                 "blob": blob,
                 "token": token_b64,
                 "expires_at": expires_at,
+                "role": role,
             }))
             .send()?;
 
@@ -901,8 +968,9 @@ impl VaultContext {
         collection_name: &str,
         target_client: &str,
         validity: Option<String>,
+        role: Option<String>,
     ) -> Result<(), Box<dyn Error>> {
-        let token = self.api_invite_client(collection_name, target_client, validity)?;
+        let token = self.api_invite_client(collection_name, target_client, validity, role)?;
         println!("{}", token);
         Ok(())
     }
@@ -1094,11 +1162,16 @@ impl VaultContext {
         Ok(())
     }
 
-    fn cmd_delete_client(&mut self) -> Result<(), Box<dyn Error>> {
+    fn cmd_delete_client(&mut self, target_client: Option<&str>) -> Result<(), Box<dyn Error>> {
         let session = self.session.as_ref().unwrap();
+        let client_to_delete = target_client.unwrap_or(&self.clientname);
         let resp = self
             .client
-            .delete(format!("{}/vault/v1/client", self.base_url))
+            .delete(format!(
+                "{}/vault/v1/client/{}",
+                self.base_url,
+                url_encode(client_to_delete)
+            ))
             .bearer_auth(&session.token)
             .send()?;
 
@@ -1201,7 +1274,7 @@ impl VaultContext {
         collection: &str,
         create_if_missing: bool,
         secrets: &[(String, Option<String>)],
-        invites: &[(String, Option<String>)],
+        invites: &[(String, Option<String>, Option<String>)],
     ) -> Result<serde_json::Value, Box<dyn Error>> {
         let state = self.get_state()?;
         let collection_existed = state
@@ -1287,7 +1360,7 @@ impl VaultContext {
         }
 
         let mut invite_results: Vec<serde_json::Value> = Vec::with_capacity(invites.len());
-        for (client, validity) in invites {
+        for (client, validity, role) in invites {
             if client.is_empty() {
                 invite_results.push(serde_json::json!({
                     "client": client,
@@ -1296,7 +1369,7 @@ impl VaultContext {
                 }));
                 continue;
             }
-            match self.api_invite_client(collection, client, validity.clone()) {
+            match self.api_invite_client(collection, client, validity.clone(), role.clone()) {
                 Ok(token) => invite_results.push(serde_json::json!({
                     "client": client,
                     "status": "invited",
@@ -1635,7 +1708,7 @@ impl VaultContext {
                                     .collect()
                             })
                             .unwrap_or_default();
-                        let invites: Vec<(String, Option<String>)> = body
+                        let invites: Vec<(String, Option<String>, Option<String>)> = body
                             .get("invites")
                             .and_then(|v| v.as_array())
                             .map(|arr| {
@@ -1651,7 +1724,12 @@ impl VaultContext {
                                             .and_then(|v| v.as_str())
                                             .filter(|s| !s.is_empty())
                                             .map(String::from);
-                                        (client, validity)
+                                        let role = item
+                                            .get("role")
+                                            .and_then(|v| v.as_str())
+                                            .filter(|s| !s.is_empty())
+                                            .map(String::from);
+                                        (client, validity, role)
                                     })
                                     .collect()
                             })
@@ -1759,6 +1837,28 @@ impl VaultContext {
         Ok(())
     }
 
+    fn cmd_reset_client(&mut self, target_client: &str) -> Result<String, Box<dyn Error>> {
+        let mut reset_secret = [0u8; 32];
+        rand::thread_rng().fill_bytes(&mut reset_secret);
+        let token_b64 = B64URL.encode(&reset_secret);
+
+        let resp = self
+            .client
+            .post(format!(
+                "{}/vault/v1/client/{}/reset-token",
+                self.base_url,
+                url_encode(target_client)
+            ))
+            .bearer_auth(&self.session.as_ref().unwrap().token)
+            .json(&serde_json::json!({"token": token_b64}))
+            .send()?;
+
+        if !resp.status().is_success() {
+            return Err(format!("Failed to generate reset token: {}", resp.text()?).into());
+        }
+        Ok(token_b64)
+    }
+
     fn run_command(&mut self, command: Commands) -> Result<(), Box<dyn Error>> {
         match &command {
             Commands::Ui => {
@@ -1789,7 +1889,8 @@ impl VaultContext {
                     name,
                     client,
                     validity,
-                } => self.invite_client(&name, &client, validity)?,
+                    role,
+                } => self.invite_client(&name, &client, validity, role)?,
                 CollectionCommands::Delete { name } => self.cmd_delete_collection(&name)?,
                 CollectionCommands::RemoveClient { name, client } => {
                     self.cmd_remove_client(&name, &client)?
@@ -1802,7 +1903,11 @@ impl VaultContext {
                 }
             },
             Commands::Client { action } => match action {
-                ClientCommands::Delete => self.cmd_delete_client()?,
+                ClientCommands::Delete { client } => self.cmd_delete_client(client.as_deref())?,
+                ClientCommands::Reset { client } => {
+                    let token = self.cmd_reset_client(&client)?;
+                    println!("{}", token);
+                }
             },
             Commands::Batch { file } => {
                 let content = std::fs::read_to_string(file)?;
