@@ -195,7 +195,7 @@ jobs:
         id: pkg
         run: |
           mkdir -p dist
-          ASSET="rescile-vault-${{ steps.tag.outputs.tag }}-${{ matrix.name }}"
+          ASSET="rescile-vault-${{ matrix.name }}"
           cp "target/${{ matrix.target }}/release/rescile-vault" "dist/${ASSET}"
           ( cd dist && sha256sum "${ASSET}" > "${ASSET}.sha256" )
           echo "asset=${ASSET}" >> "$GITHUB_OUTPUT"
