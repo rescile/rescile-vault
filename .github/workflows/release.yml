@@ -248,3 +248,25 @@ jobs:
           fail_on_unmatched_files: true
           # If `just mark-release` already created the release with notes,
           # this action just appends the assets and leaves the body alone.
+
+      - name: Checkout tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.tag.outputs.tag }}
+          path: _repo_checkout
+          fetch-depth: 1
+
+      - name: Move latest tag
+        working-directory: _repo_checkout
+        run: |
+          git tag -f latest
+          git push origin latest --force
+
+      - name: Upload assets to latest release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: latest
+          make_latest: false
+          files: |
+            artifacts/*
+          fail_on_unmatched_files: true
