@@ -156,7 +156,6 @@ jobs:
         run: |
           cargo zigbuild \
             --release \
-            --locked \
             --target ${{ matrix.target }} \
             --features ${{ matrix.features }}
 
@@ -167,7 +166,6 @@ jobs:
         run: |
           cargo build \
             --release \
-            --locked \
             --target ${{ matrix.target }} \
             --features ${{ matrix.features }}
 
