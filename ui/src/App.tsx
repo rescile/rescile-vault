@@ -16,6 +16,7 @@ type CollectionInfo = {
   pending_invite: boolean
   members: string[]
   pending_invitees: string[]
+  secrets: string[]
 }
 
 type State = {
@@ -650,17 +651,19 @@ function VaultBrowser({ onLogout }: { onLogout: () => void }) {
       setInviteMessage({ kind: 'err', text: 'Server returned no invite result.' })
       return
     }
-    if (result.status === 'invited' && result.token) {
-      setIssuedInvites(prev => [
-        {
-          id: newId(),
-          client: result.client,
-          token: result.token!,
-          validity: inviteValidity.trim() || undefined,
-        },
-        ...prev,
-      ])
-      setInviteMessage({ kind: 'ok', text: `Invited "${result.client}".` })
+    if ((result.status === 'invited' && result.token) || result.status === 'enrolled') {
+      if (result.token) {
+        setIssuedInvites(prev => [
+          {
+            id: newId(),
+            client: result.client,
+            token: result.token!,
+            validity: inviteValidity.trim() || undefined,
+          },
+          ...prev,
+        ])
+      }
+      setInviteMessage({ kind: 'ok', text: result.status === 'enrolled' ? `Enrolled "${result.client}" directly.` : `Invited "${result.client}".` })
       setInviteClient('')
       setInviteValidity('')
       refresh()
@@ -786,6 +789,22 @@ function VaultBrowser({ onLogout }: { onLogout: () => void }) {
               Open
             </button>
           </form>
+
+        {activeCollection?.secrets && activeCollection.secrets.length > 0 && (
+            <div className="collection-chips" style={{ marginTop: '1rem' }}>
+              {activeCollection.secrets.map(id => (
+                <button
+                  type="button"
+                  key={id}
+                  className="collection-chip"
+                  onClick={() => addSecretRow(id, true)}
+                  title={id}
+                >
+                  {id.slice(0, 8)}...
+                </button>
+              ))}
+            </div>
+          )}
 
           {secretRows.length === 0 ? (
             <p className="muted">No secrets open. Add one above to begin.</p>

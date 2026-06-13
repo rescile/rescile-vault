@@ -929,6 +929,61 @@ impl VaultContext {
             None => None,
         };
 
+        let pubkey_resp = self
+            .client
+            .get(format!(
+                "{}/vault/v1/client/{}/pubkey",
+                self.base_url,
+                url_encode(target_client)
+            ))
+            .send()?;
+
+        if pubkey_resp.status().is_success() {
+            let pubkey_b64 = pubkey_resp.text()?;
+            if let Ok(recipient_public_bytes) = B64URL.decode(&pubkey_b64) {
+                if let Ok(recipient_public_bytes_array) =
+                    <[u8; 32]>::try_from(recipient_public_bytes.as_slice())
+                {
+                    let recipient_public = PublicKey::from(recipient_public_bytes_array);
+                    let mut rng = rand::thread_rng();
+                    let ephemeral_secret = EphemeralSecret::random_from_rng(&mut rng);
+                    let ephemeral_public = PublicKey::from(&ephemeral_secret);
+                    let shared_secret = ephemeral_secret.diffie_hellman(&recipient_public);
+                    let hkdf = hkdf::Hkdf::<sha2::Sha256>::new(None, shared_secret.as_bytes());
+                    let mut wrap_key = [0u8; 32];
+                    hkdf.expand(b"rescile-collection-wrap-v1", &mut wrap_key)
+                        .unwrap();
+                    let wrapped_blob = encrypt_blob(&collection_key, &wrap_key);
+                    let wrapped_key = WrappedKey {
+                        ephemeral_public_key: B64URL.encode(ephemeral_public.as_bytes()),
+                        nonce: wrapped_blob.nonce,
+                        ciphertext: wrapped_blob.ciphertext,
+                        tag: wrapped_blob.tag,
+                    };
+
+                    let resp = self
+                        .client
+                        .post(format!(
+                            "{}/vault/v1/collection/{}/invite",
+                            self.base_url, collection_name
+                        ))
+                        .bearer_auth(&self.session.as_ref().unwrap().token)
+                        .json(&serde_json::json!({
+                            "client_id": target_client,
+                            "wrapped_key": wrapped_key,
+                            "expires_at": expires_at,
+                            "role": role,
+                        }))
+                        .send()?;
+
+                    if !resp.status().is_success() {
+                        return Err(format!("Failed to invite client: {}", resp.text()?).into());
+                    }
+                    return Ok(String::new());
+                }
+            }
+        }
+
         let token_resp = self
             .client
             .get(format!(
@@ -991,7 +1046,11 @@ impl VaultContext {
         role: Option<String>,
     ) -> Result<(), Box<dyn Error>> {
         let token = self.api_invite_client(collection_name, target_client, validity, role)?;
-        println!("{}", token);
+        if token.is_empty() {
+            println!("Enrolled directly (no token needed)");
+        } else {
+            println!("{}", token);
+        }
         Ok(())
     }
 
@@ -1205,7 +1264,14 @@ impl VaultContext {
         hasher.update(collection.as_bytes());
         hasher.update(secret_name.as_bytes());
         hasher.update(&name_salt);
-        let id = hasher.finalize().to_string();
+        let hashed_id = hasher.finalize().to_string();
+
+        let id = state
+            .ciphers
+            .iter()
+            .find(|c| c.collection_id == collection && (c.id == hashed_id || c.id == secret_name))
+            .map(|c| c.id.clone())
+            .unwrap_or(hashed_id);
 
         if let Some(cipher) = state.ciphers.iter().find(|c| c.id == id) {
             let pt = decrypt_cipher_blob(&cipher.blob, &collection_key)
@@ -1250,7 +1316,14 @@ impl VaultContext {
         hasher.update(collection.as_bytes());
         hasher.update(secret_name.as_bytes());
         hasher.update(&name_salt);
-        let id = hasher.finalize().to_string();
+        let hashed_id = hasher.finalize().to_string();
+
+        let id = state
+            .ciphers
+            .iter()
+            .find(|c| c.collection_id == collection && (c.id == hashed_id || c.id == secret_name))
+            .map(|c| c.id.clone())
+            .unwrap_or(hashed_id);
 
         let (final_value, generated) = match secret_value {
             Some(v) if !v.is_empty() => (v, false),
@@ -1327,7 +1400,10 @@ impl VaultContext {
                 hasher.update(name.as_bytes());
                 hasher.update(&name_salt);
                 let id = hasher.finalize().to_string();
-                state.ciphers.iter().any(|c| c.id == id)
+                state
+                    .ciphers
+                    .iter()
+                    .any(|c| c.collection_id == collection && (c.id == id || c.id == *name))
             })
             .collect();
         drop(state);
@@ -1396,8 +1472,8 @@ impl VaultContext {
             match self.api_invite_client(collection, client, validity.clone(), role.clone()) {
                 Ok(token) => invite_results.push(serde_json::json!({
                     "client": client,
-                    "status": "invited",
-                    "token": token,
+                    "status": if token.is_empty() { "enrolled" } else { "invited" },
+                    "token": if token.is_empty() { serde_json::Value::Null } else { serde_json::json!(token) },
                 })),
                 Err(e) => invite_results.push(serde_json::json!({
                     "client": client,
@@ -1571,12 +1647,19 @@ impl VaultContext {
                                             let mut pending_invitees: Vec<&String> =
                                                 c.pending_invites.keys().collect();
                                             pending_invitees.sort();
+                                            let secrets: Vec<String> = state
+                                                .ciphers
+                                                .iter()
+                                                .filter(|cipher| cipher.collection_id == c.collection_id)
+                                                .map(|cipher| cipher.id.clone())
+                                                .collect();
                                             serde_json::json!({
                                                 "name": c.collection_id,
                                                 "has_access": c.client_access.contains_key(&clientname),
                                                 "pending_invite": c.pending_invites.contains_key(&clientname),
                                                 "members": members,
                                                 "pending_invitees": pending_invitees,
+                                                "secrets": secrets,
                                             })
                                         })
                                         .collect();
