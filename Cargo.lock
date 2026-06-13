@@ -1387,7 +1387,7 @@ dependencies = [
 
 [[package]]
 name = "rescile-vault"
-version = "0.5.2+20260609094746"
+version = "0.5.6+20260613140126"
 dependencies = [
  "aes-gcm",
  "argon2",

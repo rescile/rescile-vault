@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import type { FormEvent } from 'react'
+import type { FormEvent, ChangeEvent } from 'react'
 
 type Config = {
   url: string
@@ -228,10 +228,12 @@ function SecretRowItem({
   onChange: (patch: Partial<SecretRow>) => void
   onRemove: () => void
 }) {
+  const fileInputRef = useRef<HTMLInputElement>(null)
+
   async function call(
     path: string,
     body: Record<string, unknown>,
-  ): Promise<{ ok: boolean; data: { value?: string; generated?: boolean; error?: string } }> {
+  ): Promise<{ ok: boolean; data: { value?: string; generated?: boolean; error?: string; file_base64?: string; is_binary?: boolean } }> {
     return api(path, { method: 'POST', body: JSON.stringify(body) })
   }
 
@@ -247,7 +249,7 @@ function SecretRowItem({
           kind: 'ok',
           text: data.generated
             ? 'Did not exist — generated and stored a new value.'
-            : 'Fetched.',
+            : data.is_binary ? 'Fetched binary secret.' : 'Fetched.',
         },
       })
     } else {
@@ -290,6 +292,76 @@ function SecretRowItem({
     } else {
       onChange({ busy: false, message: { kind: 'err', text: data.error || 'Failed to generate.' } })
     }
+  }
+
+  async function handleDownload() {
+    onChange({ busy: true, message: null })
+    const { ok, data } = await call('/api/secret/get', { collection, name: row.name })
+    if (ok) {
+      if (data.file_base64) {
+        const binStr = atob(data.file_base64)
+        const bytes = new Uint8Array(binStr.length)
+        for (let i = 0; i < binStr.length; i++) {
+          bytes[i] = binStr.charCodeAt(i)
+        }
+        const blob = new Blob([bytes], { type: 'application/octet-stream' })
+        const url = URL.createObjectURL(blob)
+        const a = document.createElement('a')
+        a.href = url
+        a.download = row.name
+        document.body.appendChild(a)
+        a.click()
+        document.body.removeChild(a)
+        URL.revokeObjectURL(url)
+      }
+      onChange({
+        busy: false,
+        message: { kind: 'ok', text: 'Downloaded.' }
+      })
+    } else {
+      onChange({ busy: false, message: { kind: 'err', text: data.error || 'Failed to download.' } })
+    }
+  }
+
+  async function handleUpload(e: ChangeEvent<HTMLInputElement>) {
+    const file = e.target.files?.[0]
+    if (!file) return
+    e.target.value = ''
+    if (file.size > 1024 * 1024) {
+      onChange({ busy: false, message: { kind: 'err', text: 'File exceeds the maximum allowed size of 1 Megabyte.' } })
+      return
+    }
+    onChange({ busy: true, message: null })
+
+    const reader = new FileReader()
+    reader.onload = async () => {
+      const bytes = new Uint8Array(reader.result as ArrayBuffer)
+      let binary = ''
+      for (let i = 0; i < bytes.byteLength; i++) {
+        binary += String.fromCharCode(bytes[i])
+      }
+      const file_base64 = btoa(binary)
+
+      const { ok, data } = await call('/api/secret/put', {
+        collection,
+        name: row.name,
+        file_base64,
+      })
+      if (ok) {
+        onChange({
+          busy: false,
+          value: data.value || '',
+          revealed: false,
+          message: { kind: 'ok', text: 'Uploaded.' },
+        })
+      } else {
+        onChange({ busy: false, message: { kind: 'err', text: data.error || 'Failed to upload.' } })
+      }
+    }
+    reader.onerror = () => {
+      onChange({ busy: false, message: { kind: 'err', text: 'Failed to read file.' } })
+    }
+    reader.readAsArrayBuffer(file)
   }
 
   async function handleDelete() {
@@ -370,6 +442,13 @@ function SecretRowItem({
         <button type="button" className="button" onClick={handleGenerate} disabled={row.busy}>
           Generate
         </button>
+        <button type="button" className="button" onClick={handleDownload} disabled={row.busy}>
+          Download
+        </button>
+        <button type="button" className="button" onClick={() => fileInputRef.current?.click()} disabled={row.busy}>
+          Upload
+        </button>
+        <input ref={fileInputRef} type="file" onChange={handleUpload} style={{ display: 'none' }} />
         <button
           type="button"
           className="button danger"
@@ -477,7 +556,7 @@ function VaultBrowser({ onLogout }: { onLogout: () => void }) {
     if (autoFetch) {
       // Fetch via the API directly so we can update this freshly-created row.
       void (async () => {
-        const { ok, data } = await api<{ value?: string; generated?: boolean; error?: string }>(
+        const { ok, data } = await api<{ value?: string; generated?: boolean; error?: string; is_binary?: boolean }>(
           '/api/secret/get',
           {
             method: 'POST',
@@ -496,7 +575,7 @@ function VaultBrowser({ onLogout }: { onLogout: () => void }) {
                         kind: 'ok',
                         text: data.generated
                           ? 'Did not exist — generated and stored a new value.'
-                          : 'Fetched.',
+                          : data.is_binary ? 'Fetched binary secret.' : 'Fetched.',
                       }
                     : { kind: 'err', text: data.error || 'Failed to fetch.' },
                 }

@@ -21,6 +21,8 @@ struct Asset;
 #[cfg(feature = "tpm")]
 mod tpm;
 
+mod update;
+
 /// Rescile Vault: E2EE Secret Manager
 #[derive(Parser, Debug, Clone)]
 #[command(name = "rescile-vault", author, version, about)]
@@ -74,18 +76,27 @@ enum Commands {
     Batch { file: std::path::PathBuf },
     /// Start the Web UI
     Ui,
+    /// Update the application to the latest or a specific version
+    Update(update::UpdateArgs),
 }
 
 #[derive(Subcommand, Debug, Clone)]
 enum SecretCommands {
+    List {
+        collection: String,
+    },
     Get {
         collection: String,
         secret_name: String,
+        #[arg(long, short)]
+        file: Option<std::path::PathBuf>,
     },
     Put {
         collection: String,
         secret_name: String,
         secret_value: Option<String>,
+        #[arg(long, short)]
+        file: Option<std::path::PathBuf>,
     },
     Delete {
         collection: String,
@@ -95,6 +106,7 @@ enum SecretCommands {
 
 #[derive(Subcommand, Debug, Clone)]
 enum CollectionCommands {
+    List,
     Create {
         name: String,
     },
@@ -131,6 +143,10 @@ enum CollectionCommands {
 
 #[derive(Subcommand, Debug, Clone)]
 enum ClientCommands {
+    List {
+        #[arg(long)]
+        collection: String,
+    },
     Delete {
         #[arg(long)]
         client: Option<String>,
@@ -843,7 +859,11 @@ impl VaultContext {
                     .insert("default".to_string(), collection_key);
                 return Ok(collection_key);
             } else {
-                return Err(format!("Collection '{}' not found", collection_name).into());
+                return Err(format!(
+                    "Collection '{}' not found or you don't have access to it",
+                    collection_name
+                )
+                .into());
             }
         }
     }
@@ -975,43 +995,20 @@ impl VaultContext {
         Ok(())
     }
 
-    fn cmd_get(&mut self, collection: &str, secret_name: &str) -> Result<(), Box<dyn Error>> {
-        let mut state = self.get_state()?;
-        let collection_key = self.resolve_collection_key(collection, &mut state)?;
-
-        let session = self.session.as_ref().unwrap();
-        let name_salt = B64URL.decode(&session.name_salt).unwrap();
-        let mut hasher = blake3::Hasher::new();
-        hasher.update(collection.as_bytes());
-        hasher.update(secret_name.as_bytes());
-        hasher.update(&name_salt);
-        let id = hasher.finalize().to_string();
-
-        if let Some(cipher) = state.ciphers.iter().find(|c| c.id == id) {
-            let pt = decrypt_cipher_blob(&cipher.blob, &collection_key).expect("Failed to decrypt");
-            print!("{}", String::from_utf8_lossy(&pt).trim_end());
-            return Ok(());
+    fn cmd_get(
+        &mut self,
+        collection: &str,
+        secret_name: &str,
+        file: Option<&std::path::PathBuf>,
+    ) -> Result<(), Box<dyn Error>> {
+        let (bytes, _) = self.api_get_secret_bytes(collection, secret_name)?;
+        if let Some(path) = file {
+            std::fs::write(path, bytes)?;
+        } else {
+            print!("{}", String::from_utf8_lossy(&bytes).trim_end());
         }
 
-        // Secret not found -> Generate, Encrypt, and Push to Vault
-        let new_password = generate_random_password(32);
-        let new_blob = encrypt_cipher_blob(new_password.as_bytes(), &collection_key);
-
-        let put_resp = self.client.put(format!("{}/vault/v1/cipher/{}", self.base_url, id))
-            .bearer_auth(&session.token)
-            .json(&serde_json::json!({
-                "collection_id": collection,
-                "blob": new_blob,
-                "updated_at": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64
-            }))
-            .send()?;
-
-        if !put_resp.status().is_success() {
-            return Err(format!("Failed to save new cipher: {}", put_resp.text()?).into());
-        }
-
-        print!("{}", new_password);
-        return Ok(());
+        Ok(())
     }
 
     fn cmd_put(
@@ -1019,43 +1016,15 @@ impl VaultContext {
         collection: &str,
         secret_name: &str,
         secret_value: Option<String>,
+        file: Option<&std::path::PathBuf>,
     ) -> Result<(), Box<dyn Error>> {
-        let mut state = self.get_state()?;
-        let collection_key = self.resolve_collection_key(collection, &mut state)?;
-
-        let session = self.session.as_ref().unwrap();
-        let name_salt = B64URL.decode(&session.name_salt).unwrap();
-        let mut hasher = blake3::Hasher::new();
-        hasher.update(collection.as_bytes());
-        hasher.update(secret_name.as_bytes());
-        hasher.update(&name_salt);
-        let id = hasher.finalize().to_string();
-
-        let final_value = match secret_value {
-            Some(v) if !v.is_empty() => v,
-            _ => {
-                if state.ciphers.iter().any(|c| c.id == id) {
-                    return Ok(());
-                }
-                generate_random_password(32)
-            }
+        let final_value = if let Some(path) = file {
+            Some(std::fs::read(path)?)
+        } else {
+            secret_value.map(|s| s.into_bytes())
         };
 
-        let new_blob = encrypt_cipher_blob(final_value.as_bytes(), &collection_key);
-
-        let put_resp = self.client.put(format!("{}/vault/v1/cipher/{}", self.base_url, id))
-            .bearer_auth(&session.token)
-            .json(&serde_json::json!({
-                "collection_id": collection,
-                "blob": new_blob,
-                "updated_at": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64
-            }))
-            .send()?;
-
-        if !put_resp.status().is_success() {
-            return Err(format!("Failed to save cipher: {}", put_resp.text()?).into());
-        }
-
+        self.api_put_secret_bytes(collection, secret_name, final_value)?;
         Ok(())
     }
 
@@ -1162,6 +1131,47 @@ impl VaultContext {
         Ok(())
     }
 
+    fn cmd_list_collections(&self) -> Result<(), Box<dyn Error>> {
+        let state = self.get_state()?;
+        for col in state.collections {
+            println!("{}", col.collection_id);
+        }
+        Ok(())
+    }
+
+    fn cmd_list_secrets(&self, collection: &str) -> Result<(), Box<dyn Error>> {
+        let state = self.get_state()?;
+        for c in state.ciphers {
+            if c.collection_id == collection {
+                println!("{}", c.id);
+            }
+        }
+        Ok(())
+    }
+
+    fn cmd_list_clients(&self, collection: &str) -> Result<(), Box<dyn Error>> {
+        let state = self.get_state()?;
+        if let Some(col) = state
+            .collections
+            .iter()
+            .find(|c| c.collection_id == collection)
+        {
+            for client in col.client_access.keys() {
+                println!("{}\tenrolled", client);
+            }
+            for client in col.pending_invites.keys() {
+                println!("{}\tinvited", client);
+            }
+        } else {
+            return Err(format!(
+                "Collection '{}' not found or you don't have access to it",
+                collection
+            )
+            .into());
+        }
+        Ok(())
+    }
+
     fn cmd_delete_client(&mut self, target_client: Option<&str>) -> Result<(), Box<dyn Error>> {
         let session = self.session.as_ref().unwrap();
         let client_to_delete = target_client.unwrap_or(&self.clientname);
@@ -1181,11 +1191,11 @@ impl VaultContext {
         Ok(())
     }
 
-    fn api_get_secret(
+    fn api_get_secret_bytes(
         &mut self,
         collection: &str,
         secret_name: &str,
-    ) -> Result<(String, bool), Box<dyn Error>> {
+    ) -> Result<(Vec<u8>, bool), Box<dyn Error>> {
         let mut state = self.get_state()?;
         let collection_key = self.resolve_collection_key(collection, &mut state)?;
 
@@ -1200,12 +1210,11 @@ impl VaultContext {
         if let Some(cipher) = state.ciphers.iter().find(|c| c.id == id) {
             let pt = decrypt_cipher_blob(&cipher.blob, &collection_key)
                 .ok_or("Failed to decrypt cipher")?;
-            let value = String::from_utf8_lossy(&pt).trim_end().to_string();
-            return Ok((value, false));
+            return Ok((pt, false));
         }
 
-        let new_password = generate_random_password(32);
-        let new_blob = encrypt_cipher_blob(new_password.as_bytes(), &collection_key);
+        let new_password = generate_random_password(32).into_bytes();
+        let new_blob = encrypt_cipher_blob(&new_password, &collection_key);
 
         let put_resp = self
             .client
@@ -1226,12 +1235,12 @@ impl VaultContext {
         Ok((new_password, true))
     }
 
-    fn api_put_secret(
+    fn api_put_secret_bytes(
         &mut self,
         collection: &str,
         secret_name: &str,
-        secret_value: Option<String>,
-    ) -> Result<(String, bool), Box<dyn Error>> {
+        secret_value: Option<Vec<u8>>,
+    ) -> Result<(Vec<u8>, bool), Box<dyn Error>> {
         let mut state = self.get_state()?;
         let collection_key = self.resolve_collection_key(collection, &mut state)?;
 
@@ -1245,10 +1254,14 @@ impl VaultContext {
 
         let (final_value, generated) = match secret_value {
             Some(v) if !v.is_empty() => (v, false),
-            _ => (generate_random_password(32), true),
+            _ => (generate_random_password(32).into_bytes(), true),
         };
 
-        let new_blob = encrypt_cipher_blob(final_value.as_bytes(), &collection_key);
+        if final_value.len() > 1024 * 1024 {
+            return Err("Secret exceeds the maximum allowed size of 1 Megabyte.".into());
+        }
+
+        let new_blob = encrypt_cipher_blob(&final_value, &collection_key);
 
         let put_resp = self
             .client
@@ -1263,6 +1276,9 @@ impl VaultContext {
             .send()?;
 
         if !put_resp.status().is_success() {
+            if put_resp.status() == reqwest::StatusCode::PAYLOAD_TOO_LARGE {
+                return Err("Secret exceeds the maximum allowed size of 1 Megabyte.".into());
+            }
             return Err(format!("Failed to save cipher: {}", put_resp.text()?).into());
         }
 
@@ -1285,7 +1301,11 @@ impl VaultContext {
         let mut collection_created = false;
         if !collection_existed {
             if !create_if_missing {
-                return Err(format!("Collection '{}' does not exist", collection).into());
+                return Err(format!(
+                    "Collection '{}' does not exist or you don't have access to it",
+                    collection
+                )
+                .into());
             }
             self.create_collection(collection)?;
             collection_created = true;
@@ -1324,7 +1344,11 @@ impl VaultContext {
             }
             let supplied = value.as_deref().map(|v| !v.is_empty()).unwrap_or(false);
             if supplied {
-                match self.api_put_secret(collection, name, value.clone()) {
+                match self.api_put_secret_bytes(
+                    collection,
+                    name,
+                    value.clone().map(|s| s.into_bytes()),
+                ) {
                     Ok(_) => secret_results.push(serde_json::json!({
                         "name": name,
                         "status": if *existed { "updated" } else { "created" },
@@ -1343,12 +1367,12 @@ impl VaultContext {
                     "generated": false,
                 }));
             } else {
-                match self.api_put_secret(collection, name, None) {
+                match self.api_put_secret_bytes(collection, name, None) {
                     Ok((generated_value, _)) => secret_results.push(serde_json::json!({
                         "name": name,
                         "status": "created",
                         "generated": true,
-                        "value": generated_value,
+                        "value": String::from_utf8_lossy(&generated_value).into_owned(),
                     })),
                     Err(e) => secret_results.push(serde_json::json!({
                         "name": name,
@@ -1624,11 +1648,19 @@ impl VaultContext {
                                     serde_json::json!({"error": "Not authenticated"}),
                                 ));
                             }
-                            Some(ctx) => match ctx.api_get_secret(&collection, &name) {
-                                Ok((value, generated)) => {
+                            Some(ctx) => match ctx.api_get_secret_bytes(&collection, &name) {
+                                Ok((bytes, generated)) => {
+                                    let is_utf8 = std::str::from_utf8(&bytes).is_ok();
+                                    let value = if is_utf8 {
+                                        String::from_utf8_lossy(&bytes).trim_end().to_string()
+                                    } else {
+                                        "".to_string()
+                                    };
+                                    let b64 =
+                                        base64::engine::general_purpose::STANDARD.encode(&bytes);
                                     let _ = request.respond(json_response(
                                         200,
-                                        serde_json::json!({"value": value, "generated": generated}),
+                                        serde_json::json!({"value": value, "file_base64": b64, "is_binary": !is_utf8, "generated": generated}),
                                     ));
                                 }
                                 Err(e) => {
@@ -1644,6 +1676,7 @@ impl VaultContext {
                         let collection = str_field("collection").unwrap_or_default();
                         let name = str_field("name").unwrap_or_default();
                         let value_opt = str_field("value");
+                        let b64_opt = str_field("file_base64");
                         if collection.is_empty() || name.is_empty() {
                             let _ = request.respond(json_response(
                                 400,
@@ -1651,6 +1684,17 @@ impl VaultContext {
                             ));
                             continue;
                         }
+
+                        let final_value = if let Some(b64) = b64_opt {
+                            Some(
+                                base64::engine::general_purpose::STANDARD
+                                    .decode(&b64)
+                                    .unwrap_or_default(),
+                            )
+                        } else {
+                            value_opt.map(|s| s.into_bytes())
+                        };
+
                         let mut guard = ctx_lock.lock().unwrap();
                         match guard.as_mut() {
                             None => {
@@ -1659,20 +1703,24 @@ impl VaultContext {
                                     serde_json::json!({"error": "Not authenticated"}),
                                 ));
                             }
-                            Some(ctx) => match ctx.api_put_secret(&collection, &name, value_opt) {
-                                Ok((value, generated)) => {
-                                    let _ = request.respond(json_response(
+                            Some(ctx) => {
+                                match ctx.api_put_secret_bytes(&collection, &name, final_value) {
+                                    Ok((bytes, generated)) => {
+                                        let value =
+                                            String::from_utf8_lossy(&bytes).trim_end().to_string();
+                                        let _ = request.respond(json_response(
                                         200,
                                         serde_json::json!({"value": value, "generated": generated}),
                                     ));
+                                    }
+                                    Err(e) => {
+                                        let _ = request.respond(json_response(
+                                            400,
+                                            serde_json::json!({"error": format!("{}", e)}),
+                                        ));
+                                    }
                                 }
-                                Err(e) => {
-                                    let _ = request.respond(json_response(
-                                        400,
-                                        serde_json::json!({"error": format!("{}", e)}),
-                                    ));
-                                }
-                            },
+                            }
                         }
                     }
                     (Method::Post, "/api/batch") => {
@@ -1865,25 +1913,33 @@ impl VaultContext {
                 self.cmd_ui()?;
                 return Ok(());
             }
+            Commands::Update(args) => {
+                update::handle_update(args.clone(), "rescile-vault")?;
+                return Ok(());
+            }
             _ => self.authenticate()?,
         }
         match command {
             Commands::Secret { action } => match action {
+                SecretCommands::List { collection } => self.cmd_list_secrets(&collection)?,
                 SecretCommands::Get {
                     collection,
                     secret_name,
-                } => self.cmd_get(&collection, &secret_name)?,
+                    file,
+                } => self.cmd_get(&collection, &secret_name, file.as_ref())?,
                 SecretCommands::Put {
                     collection,
                     secret_name,
                     secret_value,
-                } => self.cmd_put(&collection, &secret_name, secret_value)?,
+                    file,
+                } => self.cmd_put(&collection, &secret_name, secret_value, file.as_ref())?,
                 SecretCommands::Delete {
                     collection,
                     secret_name,
                 } => self.cmd_delete_secret(&collection, &secret_name)?,
             },
             Commands::Collection { action } => match action {
+                CollectionCommands::List => self.cmd_list_collections()?,
                 CollectionCommands::Create { name } => self.create_collection(&name)?,
                 CollectionCommands::Invite {
                     name,
@@ -1903,6 +1959,7 @@ impl VaultContext {
                 }
             },
             Commands::Client { action } => match action {
+                ClientCommands::List { collection } => self.cmd_list_clients(&collection)?,
                 ClientCommands::Delete { client } => self.cmd_delete_client(client.as_deref())?,
                 ClientCommands::Reset { client } => {
                     let token = self.cmd_reset_client(&client)?;
@@ -1930,7 +1987,7 @@ impl VaultContext {
                     self.run_command(batch_cli.command)?;
                 }
             }
-            Commands::Ui => {
+            Commands::Ui | Commands::Update(_) => {
                 // Handled above
             }
         }
