@@ -679,6 +679,59 @@ impl VaultContext {
                 .send()?;
 
             if !session_resp.status().is_success() {
+                let invite_token_b64 =
+                    std::env::var("RESCILE_VAULT_INVITE_TOKEN").unwrap_or_else(|_| String::new());
+                let invite_token_b64 = if invite_token_b64.is_empty() {
+                    let resp = self
+                        .client
+                        .get(format!(
+                            "{}/vault/v1/invite/{}",
+                            self.base_url,
+                            url_encode(&self.clientname)
+                        ))
+                        .send()?;
+                    if resp.status().is_success() {
+                        resp.text()?
+                    } else {
+                        String::new()
+                    }
+                } else {
+                    invite_token_b64
+                };
+
+                if !invite_token_b64.is_empty() {
+                    let mut rng = rand::thread_rng();
+                    let static_secret = StaticSecret::random_from_rng(&mut rng);
+                    let public_key = PublicKey::from(&static_secret);
+                    let encrypted_private_key = encrypt_blob(&static_secret.to_bytes(), &kek);
+
+                    let reset_resp = self
+                        .client
+                        .post(format!(
+                            "{}/vault/v1/client/{}/reset",
+                            self.base_url,
+                            url_encode(&self.clientname)
+                        ))
+                        .json(&serde_json::json!({
+                            "token": invite_token_b64,
+                            "kdf_params": kdf_params,
+                            "auth_key": B64URL.encode(&ak),
+                            "public_key": B64URL.encode(public_key.as_bytes()),
+                            "encrypted_private_key": encrypted_private_key
+                        }))
+                        .send()?;
+
+                    if reset_resp.status().is_success() {
+                        let session_resp = self.client.post(format!("{}/vault/v1/session", self.base_url))
+                            .json(&serde_json::json!({"auth_key": B64URL.encode(&ak), "client_id": self.clientname})).send()?;
+                        if session_resp.status().is_success() {
+                            let session: SessionResponse = session_resp.json()?;
+                            self.session = Some(session);
+                            self.static_secret = Some(static_secret);
+                            return Ok(());
+                        }
+                    }
+                }
                 return Err(format!("Authentication failed: {}", session_resp.text()?).into());
             }
 
@@ -1326,8 +1379,8 @@ impl VaultContext {
             .unwrap_or(hashed_id);
 
         let (final_value, generated) = match secret_value {
-            Some(v) if !v.is_empty() => (v, false),
-            _ => (generate_random_password(32).into_bytes(), true),
+            Some(v) => (v, false),
+            None => (generate_random_password(32).into_bytes(), true),
         };
 
         if final_value.len() > 1024 * 1024 {

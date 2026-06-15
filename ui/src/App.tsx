@@ -406,7 +406,7 @@ function SecretRowItem({
           type={row.revealed ? 'text' : 'password'}
           value={row.value}
           onChange={e => onChange({ value: e.target.value })}
-          placeholder="(empty when saving = generate)"
+          placeholder="Secret value..."
           autoComplete="off"
           spellCheck={false}
         />
@@ -436,7 +436,7 @@ function SecretRowItem({
           type="button"
           className="button"
           onClick={handleSave}
-          disabled={row.busy || !row.value}
+          disabled={row.busy}
         >
           Save
         </button>
