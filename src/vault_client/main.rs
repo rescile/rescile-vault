@@ -190,7 +190,7 @@ struct SessionResponse {
     encrypted_private_key: AesGcmBlob,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 struct CipherEntry {
     id: String,
     #[allow(dead_code)]
@@ -198,7 +198,7 @@ struct CipherEntry {
     blob: String,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 struct AccessEntry {
     #[allow(dead_code)]
     role: String,
@@ -206,7 +206,7 @@ struct AccessEntry {
     wrapped_key: WrappedKey,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 struct PendingInvite {
     #[serde(flatten)]
     blob: AesGcmBlob,
@@ -221,7 +221,7 @@ struct PendingInvite {
     role: Option<String>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 struct CollectionEntry {
     collection_id: String,
     #[serde(default)]
@@ -230,7 +230,7 @@ struct CollectionEntry {
     pending_invites: std::collections::HashMap<String, PendingInvite>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 struct StateResponse {
     ciphers: Vec<CipherEntry>,
     collections: Vec<CollectionEntry>,
@@ -747,6 +747,23 @@ impl VaultContext {
         Ok(())
     }
 
+    fn extract_secret_name_and_value(
+        &self,
+        _collection: &str,
+        cipher_id: &str,
+        pt: Vec<u8>,
+    ) -> (String, Vec<u8>) {
+        if pt.starts_with(b"RV1") && pt.len() >= 7 {
+            let name_len = u32::from_le_bytes(pt[3..7].try_into().unwrap()) as usize;
+            if pt.len() >= 7 + name_len {
+                if let Ok(name_str) = std::str::from_utf8(&pt[7..7 + name_len]) {
+                    return (name_str.to_string(), pt[7 + name_len..].to_vec());
+                }
+            }
+        }
+        (cipher_id.to_string(), pt)
+    }
+
     fn get_state(&self) -> Result<StateResponse, Box<dyn Error>> {
         let state: StateResponse = self
             .client
@@ -1251,11 +1268,18 @@ impl VaultContext {
         Ok(())
     }
 
-    fn cmd_list_secrets(&self, collection: &str) -> Result<(), Box<dyn Error>> {
-        let state = self.get_state()?;
+    fn cmd_list_secrets(&mut self, collection: &str) -> Result<(), Box<dyn Error>> {
+        let mut state = self.get_state()?;
+        let collection_key = self.resolve_collection_key(collection, &mut state)?;
         for c in state.ciphers {
             if c.collection_id == collection {
-                println!("{}", c.id);
+                let name = if let Some(pt) = decrypt_cipher_blob(&c.blob, &collection_key) {
+                    let (n, _) = self.extract_secret_name_and_value(collection, &c.id, pt);
+                    n
+                } else {
+                    c.id.clone()
+                };
+                println!("{}", name);
             }
         }
         Ok(())
@@ -1329,11 +1353,19 @@ impl VaultContext {
         if let Some(cipher) = state.ciphers.iter().find(|c| c.id == id) {
             let pt = decrypt_cipher_blob(&cipher.blob, &collection_key)
                 .ok_or("Failed to decrypt cipher")?;
-            return Ok((pt, false));
+            let (_, value) = self.extract_secret_name_and_value(collection, &cipher.id, pt);
+            return Ok((value, false));
         }
 
         let new_password = generate_random_password(32).into_bytes();
-        let new_blob = encrypt_cipher_blob(&new_password, &collection_key);
+        let mut pt = Vec::new();
+        pt.extend_from_slice(b"RV1");
+        let name_bytes = secret_name.as_bytes();
+        pt.extend_from_slice(&(name_bytes.len() as u32).to_le_bytes());
+        pt.extend_from_slice(name_bytes);
+        pt.extend_from_slice(&new_password);
+
+        let new_blob = encrypt_cipher_blob(&pt, &collection_key);
 
         let put_resp = self
             .client
@@ -1387,7 +1419,14 @@ impl VaultContext {
             return Err("Secret exceeds the maximum allowed size of 1 Megabyte.".into());
         }
 
-        let new_blob = encrypt_cipher_blob(&final_value, &collection_key);
+        let mut pt = Vec::new();
+        pt.extend_from_slice(b"RV1");
+        let name_bytes = secret_name.as_bytes();
+        pt.extend_from_slice(&(name_bytes.len() as u32).to_le_bytes());
+        pt.extend_from_slice(name_bytes);
+        pt.extend_from_slice(&final_value);
+
+        let new_blob = encrypt_cipher_blob(&pt, &collection_key);
 
         let put_resp = self
             .client
@@ -1683,54 +1722,70 @@ impl VaultContext {
                                     serde_json::json!({"error": "Not authenticated"}),
                                 ));
                             }
-                            Some(ctx) => match ctx.get_state() {
-                                Ok(state) => {
-                                    let clientname = ctx.clientname.clone();
-                                    let collections: Vec<serde_json::Value> = state
-                                        .collections
-                                        .iter()
-                                        .filter(|c| {
-                                            c.client_access.contains_key(&clientname)
+                            Some(ctx) => {
+                                match ctx.get_state() {
+                                    Ok(mut state) => {
+                                        let clientname = ctx.clientname.clone();
+                                        let collections_copy = state.collections.clone();
+                                        let mut collections: Vec<serde_json::Value> = Vec::new();
+                                        for c in collections_copy {
+                                            if c.client_access.contains_key(&clientname)
                                                 || c.pending_invites.contains_key(&clientname)
-                                        })
-                                        .map(|c| {
-                                            let mut members: Vec<&String> =
-                                                c.client_access.keys().collect();
-                                            members.sort();
-                                            let mut pending_invitees: Vec<&String> =
-                                                c.pending_invites.keys().collect();
-                                            pending_invitees.sort();
-                                            let secrets: Vec<String> = state
-                                                .ciphers
-                                                .iter()
-                                                .filter(|cipher| cipher.collection_id == c.collection_id)
-                                                .map(|cipher| cipher.id.clone())
-                                                .collect();
-                                            serde_json::json!({
+                                            {
+                                                let mut members: Vec<&String> =
+                                                    c.client_access.keys().collect();
+                                                members.sort();
+                                                let mut pending_invitees: Vec<&String> =
+                                                    c.pending_invites.keys().collect();
+                                                pending_invitees.sort();
+                                                let mut secrets: Vec<String> = Vec::new();
+                                                if c.client_access.contains_key(&clientname) {
+                                                    if let Ok(collection_key) = ctx
+                                                        .resolve_collection_key(
+                                                            &c.collection_id,
+                                                            &mut state,
+                                                        )
+                                                    {
+                                                        secrets = state.ciphers.iter()
+                                                        .filter(|cipher| cipher.collection_id == c.collection_id)
+                                                        .map(|cipher| {
+                                                            if let Some(pt) = decrypt_cipher_blob(&cipher.blob, &collection_key) {
+                                                                let (n, _) = ctx.extract_secret_name_and_value(&c.collection_id, &cipher.id, pt);
+                                                                n
+                                                            } else {
+                                                                cipher.id.clone()
+                                                            }
+                                                        })
+                                                        .collect();
+                                                    }
+                                                }
+                                                secrets.sort();
+                                                collections.push(serde_json::json!({
                                                 "name": c.collection_id,
                                                 "has_access": c.client_access.contains_key(&clientname),
                                                 "pending_invite": c.pending_invites.contains_key(&clientname),
                                                 "members": members,
                                                 "pending_invitees": pending_invitees,
                                                 "secrets": secrets,
-                                            })
-                                        })
-                                        .collect();
-                                    let _ = request.respond(json_response(
-                                        200,
-                                        serde_json::json!({
-                                            "clientname": clientname,
-                                            "collections": collections,
-                                        }),
-                                    ));
+                                            }));
+                                            }
+                                        }
+                                        let _ = request.respond(json_response(
+                                            200,
+                                            serde_json::json!({
+                                                "clientname": clientname,
+                                                "collections": collections,
+                                            }),
+                                        ));
+                                    }
+                                    Err(e) => {
+                                        let _ = request.respond(json_response(
+                                            500,
+                                            serde_json::json!({"error": format!("{}", e)}),
+                                        ));
+                                    }
                                 }
-                                Err(e) => {
-                                    let _ = request.respond(json_response(
-                                        500,
-                                        serde_json::json!({"error": format!("{}", e)}),
-                                    ));
-                                }
-                            },
+                            }
                         }
                     }
                     (Method::Post, "/api/collection") => {
