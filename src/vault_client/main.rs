@@ -1357,7 +1357,7 @@ impl VaultContext {
             return Ok((value, false));
         }
 
-        let new_password = generate_random_password(32).into_bytes();
+        let new_password = Vec::new();
         let mut pt = Vec::new();
         pt.extend_from_slice(b"RV1");
         let name_bytes = secret_name.as_bytes();
@@ -1412,7 +1412,7 @@ impl VaultContext {
 
         let (final_value, generated) = match secret_value {
             Some(v) => (v, false),
-            None => (generate_random_password(32).into_bytes(), true),
+            None => (Vec::new(), true),
         };
 
         if final_value.len() > 1024 * 1024 {
