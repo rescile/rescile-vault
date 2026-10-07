@@ -116,6 +116,29 @@ h2 {
     position: relative;
 }
 
+.vault-reachability {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.5rem;
+    color: var(--muted-fg);
+    font-size: 0.875rem;
+}
+
+.vault-reachability-dot {
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+    background: var(--muted-fg);
+}
+
+.vault-reachability.reachable .vault-reachability-dot {
+    background: var(--ok-fg);
+}
+
+.vault-reachability.unavailable .vault-reachability-dot {
+    background: var(--err-fg);
+}
+
 .client-badge {
     font-size: 0.875rem;
     color: var(--muted-fg);

@@ -645,8 +645,10 @@ impl VaultContext {
 
             let session: SessionResponse = session_resp.json()?;
             let priv_key_bytes = decrypt_blob(&session.encrypted_private_key, &kek)?;
-            let static_secret =
-                StaticSecret::from(<[u8; 32]>::try_from(priv_key_bytes.as_slice()).unwrap());
+            let static_secret = StaticSecret::from(
+                <[u8; 32]>::try_from(priv_key_bytes.as_slice())
+                    .map_err(|_| "session private key has invalid length")?,
+            );
 
             self.session = Some(session);
             self.static_secret = Some(static_secret);
@@ -737,8 +739,10 @@ impl VaultContext {
 
             let session: SessionResponse = session_resp.json()?;
             let priv_key_bytes = decrypt_blob(&session.encrypted_private_key, &kek)?;
-            let static_secret =
-                StaticSecret::from(<[u8; 32]>::try_from(priv_key_bytes.as_slice()).unwrap());
+            let static_secret = StaticSecret::from(
+                <[u8; 32]>::try_from(priv_key_bytes.as_slice())
+                    .map_err(|_| "session private key has invalid length")?,
+            );
 
             self.session = Some(session);
             self.static_secret = Some(static_secret);
@@ -792,16 +796,18 @@ impl VaultContext {
         {
             if let Some(access) = col.client_access.get(&self.clientname) {
                 let wrapped_key = &access.wrapped_key;
-                let ephemeral_public_bytes =
-                    B64URL.decode(&wrapped_key.ephemeral_public_key).unwrap();
+                let ephemeral_public_bytes = B64URL
+                    .decode(&wrapped_key.ephemeral_public_key)
+                    .map_err(|e| format!("invalid ephemeral public key: {}", e))?;
                 let ephemeral_public = PublicKey::from(
-                    <[u8; 32]>::try_from(ephemeral_public_bytes.as_slice()).unwrap(),
+                    <[u8; 32]>::try_from(ephemeral_public_bytes.as_slice())
+                        .map_err(|_| "invalid ephemeral public key length")?,
                 );
                 let shared_secret = static_secret.diffie_hellman(&ephemeral_public);
                 let hkdf = hkdf::Hkdf::<sha2::Sha256>::new(None, shared_secret.as_bytes());
                 let mut wrap_key = [0u8; 32];
                 hkdf.expand(b"rescile-collection-wrap-v1", &mut wrap_key)
-                    .unwrap();
+                    .map_err(|e| format!("failed to derive collection wrap key: {}", e))?;
 
                 let wrapped_blob = AesGcmBlob {
                     nonce: wrapped_key.nonce.clone(),
@@ -956,7 +962,7 @@ impl VaultContext {
         let hkdf = hkdf::Hkdf::<sha2::Sha256>::new(None, shared_secret.as_bytes());
         let mut wrap_key = [0u8; 32];
         hkdf.expand(b"rescile-collection-wrap-v1", &mut wrap_key)
-            .unwrap();
+            .map_err(|e| format!("failed to derive invite wrap key: {}", e))?;
         let wrapped_blob = encrypt_blob(&collection_key, &wrap_key);
         let wrapped_key = WrappedKey {
             ephemeral_public_key: B64URL.encode(ephemeral_public.as_bytes()),
@@ -1130,7 +1136,7 @@ impl VaultContext {
         secret_name: &str,
         file: Option<&std::path::PathBuf>,
     ) -> Result<(), Box<dyn Error>> {
-        let (bytes, _) = self.api_get_secret_bytes(collection, secret_name)?;
+        let bytes = self.api_get_secret_bytes(collection, secret_name)?;
         if let Some(path) = file {
             std::fs::write(path, bytes)?;
         } else {
@@ -1145,7 +1151,7 @@ impl VaultContext {
         collection: &str,
         secret_name: &str,
         secret_value: Option<String>,
-        file: Option<&std::path::PathBuf>,
+        file: Option<&std::path::Path>,
     ) -> Result<(), Box<dyn Error>> {
         let final_value = if let Some(path) = file {
             Some(std::fs::read(path)?)
@@ -1153,8 +1159,16 @@ impl VaultContext {
             secret_value.map(|s| s.into_bytes())
         };
 
-        self.api_put_secret_bytes(collection, secret_name, final_value)?;
-        Ok(())
+        match final_value {
+            Some(value) if !value.is_empty() => {
+                self.api_put_secret_bytes(collection, secret_name, value)?;
+                Ok(())
+            }
+            _ => Err(format!(
+                "secret value is required for '{}/{}'; pass a value or use --file. To mark the secret as unseeded, use 'rescile-vault secret delete {0} {1}'",
+                collection, secret_name
+            ).into()),
+        }
     }
 
     fn cmd_delete_secret(
@@ -1163,7 +1177,7 @@ impl VaultContext {
         secret_name: &str,
     ) -> Result<(), Box<dyn Error>> {
         let session = self.session.as_ref().unwrap();
-        let name_salt = B64URL.decode(&session.name_salt).unwrap();
+        let name_salt = B64URL.decode(&session.name_salt)?;
         let mut hasher = blake3::Hasher::new();
         hasher.update(collection.as_bytes());
         hasher.update(secret_name.as_bytes());
@@ -1331,12 +1345,12 @@ impl VaultContext {
         &mut self,
         collection: &str,
         secret_name: &str,
-    ) -> Result<(Vec<u8>, bool), Box<dyn Error>> {
+    ) -> Result<Vec<u8>, Box<dyn Error>> {
         let mut state = self.get_state()?;
         let collection_key = self.resolve_collection_key(collection, &mut state)?;
 
         let session = self.session.as_ref().unwrap();
-        let name_salt = B64URL.decode(&session.name_salt).unwrap();
+        let name_salt = B64URL.decode(&session.name_salt)?;
         let mut hasher = blake3::Hasher::new();
         hasher.update(collection.as_bytes());
         hasher.update(secret_name.as_bytes());
@@ -1350,53 +1364,48 @@ impl VaultContext {
             .map(|c| c.id.clone())
             .unwrap_or(hashed_id);
 
-        if let Some(cipher) = state.ciphers.iter().find(|c| c.id == id) {
-            let pt = decrypt_cipher_blob(&cipher.blob, &collection_key)
-                .ok_or("Failed to decrypt cipher")?;
-            let (_, value) = self.extract_secret_name_and_value(collection, &cipher.id, pt);
-            return Ok((value, false));
+        let Some(cipher) = state.ciphers.iter().find(|c| c.id == id) else {
+            return Err(format!(
+                "Secret '{}/{}' is unseeded (no cipher found). Seed it with 'rescile-vault secret put' or delete the desired secret from the graph.",
+                collection, secret_name
+            )
+            .into());
+        };
+
+        let pt =
+            decrypt_cipher_blob(&cipher.blob, &collection_key).ok_or("Failed to decrypt cipher")?;
+        let (_, value) = self.extract_secret_name_and_value(collection, &cipher.id, pt);
+
+        if value.is_empty() {
+            return Err(format!(
+                "Secret '{}/{}' is unseeded (stored value is empty). Delete the cipher with 'rescile-vault secret delete' and seed a new value.",
+                collection, secret_name
+            )
+            .into());
         }
 
-        let new_password = Vec::new();
-        let mut pt = Vec::new();
-        pt.extend_from_slice(b"RV1");
-        let name_bytes = secret_name.as_bytes();
-        pt.extend_from_slice(&(name_bytes.len() as u32).to_le_bytes());
-        pt.extend_from_slice(name_bytes);
-        pt.extend_from_slice(&new_password);
-
-        let new_blob = encrypt_cipher_blob(&pt, &collection_key);
-
-        let put_resp = self
-            .client
-            .put(format!("{}/vault/v1/cipher/{}", self.base_url, id))
-            .bearer_auth(&session.token)
-            .json(&serde_json::json!({
-                "collection_id": collection,
-                "blob": new_blob,
-                "updated_at": std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64
-            }))
-            .send()?;
-
-        if !put_resp.status().is_success() {
-            return Err(format!("Failed to save new cipher: {}", put_resp.text()?).into());
-        }
-
-        Ok((new_password, true))
+        Ok(value)
     }
 
     fn api_put_secret_bytes(
         &mut self,
         collection: &str,
         secret_name: &str,
-        secret_value: Option<Vec<u8>>,
-    ) -> Result<(Vec<u8>, bool), Box<dyn Error>> {
+        secret_value: Vec<u8>,
+    ) -> Result<(), Box<dyn Error>> {
+        if secret_value.is_empty() {
+            return Err(format!(
+                "Refusing to store empty secret value for '{}/{}'. To mark the secret as unseeded, use 'rescile-vault secret delete {0} {1}'.",
+                collection, secret_name
+            )
+            .into());
+        }
+
         let mut state = self.get_state()?;
         let collection_key = self.resolve_collection_key(collection, &mut state)?;
 
         let session = self.session.as_ref().unwrap();
-        let name_salt = B64URL.decode(&session.name_salt).unwrap();
+        let name_salt = B64URL.decode(&session.name_salt)?;
         let mut hasher = blake3::Hasher::new();
         hasher.update(collection.as_bytes());
         hasher.update(secret_name.as_bytes());
@@ -1410,12 +1419,7 @@ impl VaultContext {
             .map(|c| c.id.clone())
             .unwrap_or(hashed_id);
 
-        let (final_value, generated) = match secret_value {
-            Some(v) => (v, false),
-            None => (Vec::new(), true),
-        };
-
-        if final_value.len() > 1024 * 1024 {
+        if secret_value.len() > 1024 * 1024 {
             return Err("Secret exceeds the maximum allowed size of 1 Megabyte.".into());
         }
 
@@ -1424,7 +1428,7 @@ impl VaultContext {
         let name_bytes = secret_name.as_bytes();
         pt.extend_from_slice(&(name_bytes.len() as u32).to_le_bytes());
         pt.extend_from_slice(name_bytes);
-        pt.extend_from_slice(&final_value);
+        pt.extend_from_slice(&secret_value);
 
         let new_blob = encrypt_cipher_blob(&pt, &collection_key);
 
@@ -1447,7 +1451,7 @@ impl VaultContext {
             return Err(format!("Failed to save cipher: {}", put_resp.text()?).into());
         }
 
-        Ok((final_value, generated))
+        Ok(())
     }
 
     fn api_batch(
@@ -1515,7 +1519,7 @@ impl VaultContext {
                 match self.api_put_secret_bytes(
                     collection,
                     name,
-                    value.clone().map(|s| s.into_bytes()),
+                    value.clone().unwrap().into_bytes(),
                 ) {
                     Ok(_) => secret_results.push(serde_json::json!({
                         "name": name,
@@ -1535,19 +1539,11 @@ impl VaultContext {
                     "generated": false,
                 }));
             } else {
-                match self.api_put_secret_bytes(collection, name, None) {
-                    Ok((generated_value, _)) => secret_results.push(serde_json::json!({
-                        "name": name,
-                        "status": "created",
-                        "generated": true,
-                        "value": String::from_utf8_lossy(&generated_value).into_owned(),
-                    })),
-                    Err(e) => secret_results.push(serde_json::json!({
-                        "name": name,
-                        "status": "error",
-                        "error": format!("{}", e),
-                    })),
-                }
+                secret_results.push(serde_json::json!({
+                    "name": name,
+                    "status": "unseeded",
+                    "error": "Secret value is required; omitting a value leaves the secret unseeded.",
+                }));
             }
         }
 
@@ -1616,6 +1612,10 @@ impl VaultContext {
         let port = server.server_addr().to_ip().unwrap().port();
         println!("Web UI started at http://127.0.0.1:{}", port);
 
+        let health_client = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(2))
+            .build()?;
+
         let json_response = |status: u16, value: serde_json::Value| {
             let body = serde_json::to_vec(&value).unwrap();
             Response::from_data(body)
@@ -1655,6 +1655,29 @@ impl VaultContext {
                 };
 
                 match (&method, path_only.as_str()) {
+                    (Method::Get, "/api/status") => {
+                        let url = ctx_lock
+                            .lock()
+                            .unwrap()
+                            .as_ref()
+                            .map(|ctx| ctx.base_url.clone())
+                            .unwrap_or_else(|| initial_url.clone());
+                        // Older vault servers lack this endpoint; status is unknown, not offline.
+                        let reachable = match health_client
+                            .get(format!("{}/vault/v1/health", url.trim_end_matches('/')))
+                            .send()
+                        {
+                            Ok(response) if response.status() == reqwest::StatusCode::NOT_FOUND => {
+                                None
+                            }
+                            Ok(response) => Some(response.status().is_success()),
+                            Err(_) => Some(false),
+                        };
+                        let _ = request.respond(json_response(
+                            200,
+                            serde_json::json!({ "reachable": reachable }),
+                        ));
+                    }
                     (Method::Get, "/api/config") => {
                         let guard = ctx_lock.lock().unwrap();
                         let (ready, current_clientname, current_url) = match guard.as_ref() {
@@ -1840,7 +1863,7 @@ impl VaultContext {
                                 ));
                             }
                             Some(ctx) => match ctx.api_get_secret_bytes(&collection, &name) {
-                                Ok((bytes, generated)) => {
+                                Ok(bytes) => {
                                     let is_utf8 = std::str::from_utf8(&bytes).is_ok();
                                     let value = if is_utf8 {
                                         String::from_utf8_lossy(&bytes).trim_end().to_string()
@@ -1851,13 +1874,15 @@ impl VaultContext {
                                         base64::engine::general_purpose::STANDARD.encode(&bytes);
                                     let _ = request.respond(json_response(
                                         200,
-                                        serde_json::json!({"value": value, "file_base64": b64, "is_binary": !is_utf8, "generated": generated}),
+                                        serde_json::json!({"value": value, "file_base64": b64, "is_binary": !is_utf8, "unseeded": false}),
                                     ));
                                 }
                                 Err(e) => {
+                                    let msg = format!("{}", e);
+                                    let status = if msg.contains("unseeded") { 404 } else { 400 };
                                     let _ = request.respond(json_response(
-                                        400,
-                                        serde_json::json!({"error": format!("{}", e)}),
+                                        status,
+                                        serde_json::json!({"error": msg, "unseeded": true}),
                                     ));
                                 }
                             },
@@ -1877,14 +1902,27 @@ impl VaultContext {
                         }
 
                         let final_value = if let Some(b64) = b64_opt {
-                            Some(
-                                base64::engine::general_purpose::STANDARD
-                                    .decode(&b64)
-                                    .unwrap_or_default(),
-                            )
+                            match base64::engine::general_purpose::STANDARD.decode(&b64) {
+                                Ok(bytes) => bytes,
+                                Err(_) => {
+                                    let _ = request.respond(json_response(
+                                        400,
+                                        serde_json::json!({"error": "Invalid base64 in file_base64"}),
+                                    ));
+                                    continue;
+                                }
+                            }
                         } else {
-                            value_opt.map(|s| s.into_bytes())
+                            value_opt.unwrap_or_default().into_bytes()
                         };
+
+                        if final_value.is_empty() {
+                            let _ = request.respond(json_response(
+                                400,
+                                serde_json::json!({"error": "Secret value is required. To mark the secret as unseeded, delete its cipher instead."}),
+                            ));
+                            continue;
+                        }
 
                         let mut guard = ctx_lock.lock().unwrap();
                         match guard.as_mut() {
@@ -1896,13 +1934,11 @@ impl VaultContext {
                             }
                             Some(ctx) => {
                                 match ctx.api_put_secret_bytes(&collection, &name, final_value) {
-                                    Ok((bytes, generated)) => {
-                                        let value =
-                                            String::from_utf8_lossy(&bytes).trim_end().to_string();
+                                    Ok(()) => {
                                         let _ = request.respond(json_response(
-                                        200,
-                                        serde_json::json!({"value": value, "generated": generated}),
-                                    ));
+                                            200,
+                                            serde_json::json!({"success": true}),
+                                        ));
                                     }
                                     Err(e) => {
                                         let _ = request.respond(json_response(
@@ -2123,7 +2159,7 @@ impl VaultContext {
                     secret_name,
                     secret_value,
                     file,
-                } => self.cmd_put(&collection, &secret_name, secret_value, file.as_ref())?,
+                } => self.cmd_put(&collection, &secret_name, secret_value, file.as_deref())?,
                 SecretCommands::Delete {
                     collection,
                     secret_name,

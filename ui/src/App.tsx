@@ -25,6 +25,7 @@ type State = {
 }
 
 type Message = { kind: 'ok' | 'err'; text: string }
+type VaultReachability = boolean | null | 'unsupported'
 
 type SecretRow = {
   id: string
@@ -85,12 +86,22 @@ function Header({
   onToggleTheme,
   clientname,
   onLogout,
+  vaultReachable,
 }: {
   theme: string
   onToggleTheme: () => void
   clientname?: string
   onLogout?: () => void
+  vaultReachable?: VaultReachability
 }) {
+  const vaultStatus = vaultReachable === null
+    ? { label: 'Checking vault…', className: 'checking' }
+    : vaultReachable === 'unsupported'
+      ? { label: 'Vault status unsupported', className: 'checking' }
+      : vaultReachable
+        ? { label: 'Vault reachable', className: 'reachable' }
+        : { label: 'Vault unavailable', className: 'unavailable' }
+
   return (
     <div className="header-container">
       <h1>
@@ -110,6 +121,12 @@ function Header({
         </a>
       </h1>
       <div className="top-nav">
+        {vaultReachable !== undefined ? (
+          <span className={`vault-reachability ${vaultStatus.className}`} role="status">
+            <span className="vault-reachability-dot" aria-hidden="true" />
+            {vaultStatus.label}
+          </span>
+        ) : null}
         {clientname ? (
           <span className="client-badge" title="Authenticated client">
             {clientname}
@@ -933,6 +950,7 @@ function App() {
   const [config, setConfig] = useState<Config | null>(null)
   const [configError, setConfigError] = useState('')
   const [authenticated, setAuthenticated] = useState(false)
+  const [vaultReachable, setVaultReachable] = useState<VaultReachability>(null)
 
   const loadConfig = useCallback(async () => {
     const { ok, data } = await api<Config>('/api/config')
@@ -950,6 +968,27 @@ function App() {
   }, [loadConfig])
 
   useEffect(() => {
+    if (!config) return
+    let active = true
+    const checkVault = async () => {
+      let reachable: boolean | 'unsupported' = false
+      try {
+        const response = await fetch('/api/status', { cache: 'no-store' })
+        if (response.ok) {
+          const data: { reachable: boolean | null } = await response.json()
+          reachable = data.reachable === null ? 'unsupported' : data.reachable === true
+        }
+      } catch {
+        // Local UI or vault API is unavailable.
+      }
+      if (active) setVaultReachable(reachable)
+    }
+    void checkVault()
+    const timer = window.setInterval(() => void checkVault(), 10000)
+    return () => { active = false; window.clearInterval(timer) }
+  }, [config, authenticated])
+
+  useEffect(() => {
     const root = document.getElementById('root')
     if (!root) return
     if (!authenticated) root.classList.add('login-mode')
@@ -958,6 +997,7 @@ function App() {
 
   const handleLogout = useCallback(async () => {
     await api('/api/logout', { method: 'POST' })
+    setVaultReachable(null)
     setAuthenticated(false)
   }, [])
 
@@ -981,6 +1021,7 @@ function App() {
         onToggleTheme={toggle}
         clientname={authenticated ? config.clientname : undefined}
         onLogout={authenticated ? handleLogout : undefined}
+        vaultReachable={vaultReachable}
       />
       <div className="content">
         {authenticated ? (
@@ -989,6 +1030,7 @@ function App() {
           <LoginCard
             config={config}
             onAuthenticated={() => {
+              setVaultReachable(null)
               setAuthenticated(true)
               void loadConfig()
             }}
