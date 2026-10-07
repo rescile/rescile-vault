@@ -140,7 +140,7 @@ pkgs.mkShell {
     [toolchain]
     channel = "stable"
     profile = "minimal"
-    components = ["rust-analyzer", "rustfmt"]
+    components = ["rust-analyzer", "rustfmt", "clippy"]
     targets = ["x86_64-unknown-linux-musl"]
     ```
     EOF

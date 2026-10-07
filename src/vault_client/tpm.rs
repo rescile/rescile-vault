@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use std::str::FromStr;
 
 use tss_esapi::{
+    Context,
     attributes::object::ObjectAttributesBuilder,
     constants::{
         capabilities::CapabilityType, response_code::Tss2ResponseCodeKind,
@@ -23,11 +24,10 @@ use tss_esapi::{
         RsaScheme, SymmetricDefinitionObject,
     },
     tcti_ldr::{DeviceConfig, TctiNameConf},
-    Context,
 };
 
-use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64URL;
 use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64URL;
 
 const RSA_KEY_AUTH: &[u8] = b"rescile-vault-tpm-v1";
 const PERSISTENT_HANDLE_START: u32 = 0x81008000;
@@ -349,7 +349,7 @@ pub fn tpm_derive_keys(
             .map_err(|_| "TPM unwrapped key has wrong length")?
     } else {
         let mut mk = [0u8; 32];
-        rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut mk);
+        rand::fill(&mut mk);
         let wrapped = wrapper.wrap_key(mk)?;
         fs::create_dir_all(path.parent().unwrap())?;
         fs::write(&path, B64URL.encode(&wrapped))?;

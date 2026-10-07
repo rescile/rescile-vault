@@ -51,6 +51,14 @@ build-static:
     echo "==> Developer build complete. Version reverted in Cargo.toml."
     echo "    Binary is available at: {{static_out_dir}}/{{name}}"
 
+# Check Rust formatting
+fmt:
+    @cargo fmt --all -- --check
+
+# Lint Rust code, including tests
+clippy:
+    @cargo clippy --all-targets -- -D warnings
+
 # Run tests
 test:
     @echo "Running tests..."

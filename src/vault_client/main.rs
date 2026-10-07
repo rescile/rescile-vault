@@ -1,11 +1,11 @@
 use aes_gcm::{
-    aead::{Aead, KeyInit},
     Aes256Gcm, Key, Nonce,
+    aead::{Aead, KeyInit},
 };
-use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64URL;
 use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64URL;
 use clap::{Parser, Subcommand};
-use rand::RngCore;
+use rand::seq::{IndexedRandom, SliceRandom};
 use reqwest::blocking::Client;
 use rust_embed::RustEmbed;
 use serde::{Deserialize, Serialize};
@@ -168,6 +168,8 @@ struct KdfParams {
     initialized: bool,
 }
 
+type MasterKeys = (Vec<u8>, Vec<u8>, KdfParams);
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 struct AesGcmBlob {
     nonce: String,
@@ -264,7 +266,7 @@ fn derive_keys(passphrase: &str, kdf: &KdfParams) -> Result<(Vec<u8>, Vec<u8>), 
 fn encrypt_blob(pt: &[u8], key: &[u8]) -> AesGcmBlob {
     let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(key));
     let mut nonce_bytes = [0u8; 12];
-    rand::thread_rng().fill_bytes(&mut nonce_bytes);
+    rand::fill(&mut nonce_bytes);
     let nonce = Nonce::from_slice(&nonce_bytes);
     let ct_with_tag = cipher.encrypt(nonce, pt).unwrap();
 
@@ -272,7 +274,7 @@ fn encrypt_blob(pt: &[u8], key: &[u8]) -> AesGcmBlob {
     let tag = &ct_with_tag[ct_with_tag.len() - 16..];
 
     AesGcmBlob {
-        nonce: B64URL.encode(&nonce_bytes),
+        nonce: B64URL.encode(nonce_bytes),
         ciphertext: B64URL.encode(ct),
         tag: B64URL.encode(tag),
     }
@@ -291,7 +293,7 @@ fn decrypt_blob(blob: &AesGcmBlob, key: &[u8]) -> Result<Vec<u8>, Box<dyn Error>
 fn encrypt_cipher_blob(pt: &[u8], key: &[u8]) -> String {
     let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(key));
     let mut nonce_bytes = [0u8; 12];
-    rand::thread_rng().fill_bytes(&mut nonce_bytes);
+    rand::fill(&mut nonce_bytes);
     let ct_with_tag = cipher.encrypt(Nonce::from_slice(&nonce_bytes), pt).unwrap();
     let mut full = nonce_bytes.to_vec();
     full.extend_from_slice(&ct_with_tag);
@@ -312,13 +314,12 @@ fn decrypt_cipher_blob(blob: &str, key: &[u8]) -> Option<Vec<u8>> {
 }
 
 fn generate_random_password(len: usize) -> String {
-    use rand::seq::SliceRandom;
     let upper = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ";
     let lower = b"abcdefghijklmnopqrstuvwxyz";
     let digits = b"0123456789";
     let special = b"!@#$%^&*";
     let all = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!@#$%^&*";
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     let effective_len = if len < 4 { 16 } else { len };
 
     let mut password: Vec<u8> = Vec::with_capacity(effective_len);
@@ -487,19 +488,19 @@ impl VaultContext {
         }
     }
 
-    fn derive_master_keys(&self) -> Result<(Vec<u8>, Vec<u8>, KdfParams), Box<dyn Error>> {
+    fn derive_master_keys(&self) -> Result<MasterKeys, Box<dyn Error>> {
         #[cfg(feature = "tpm")]
         if self.cli.tpm {
             // For TPM mode we still need KDF params for registration, but the password
             // is not used. We generate dummy KDF params with a random salt.
             let mut salt_bytes = [0u8; 32];
-            rand::thread_rng().fill_bytes(&mut salt_bytes);
+            rand::fill(&mut salt_bytes);
             let kdf_params = KdfParams {
                 algorithm: "argon2id".to_string(),
                 memory_kib: 262144,
                 iterations: 3,
                 parallelism: 4,
-                salt: B64URL.encode(&salt_bytes),
+                salt: B64URL.encode(salt_bytes),
                 initialized: true,
             };
             let (ak, kek) = tpm::tpm_derive_keys(&self.clientname)?;
@@ -512,22 +513,19 @@ impl VaultContext {
         self.derive_password_keys(password)
     }
 
-    fn derive_password_keys(
-        &self,
-        password: &str,
-    ) -> Result<(Vec<u8>, Vec<u8>, KdfParams), Box<dyn Error>> {
+    fn derive_password_keys(&self, password: &str) -> Result<MasterKeys, Box<dyn Error>> {
         let kdf_url = format!("{}/vault/v1/kdf/{}", self.base_url, self.clientname);
         let kdf_req = self.client.get(&kdf_url).send()?;
 
         let kdf_params = if kdf_req.status() == reqwest::StatusCode::NOT_FOUND {
             let mut salt_bytes = [0u8; 32];
-            rand::thread_rng().fill_bytes(&mut salt_bytes);
+            rand::fill(&mut salt_bytes);
             KdfParams {
                 algorithm: "argon2id".to_string(),
                 memory_kib: 262144,
                 iterations: 3,
                 parallelism: 4,
-                salt: B64URL.encode(&salt_bytes),
+                salt: B64URL.encode(salt_bytes),
                 initialized: true,
             }
         } else {
@@ -555,8 +553,7 @@ impl VaultContext {
             // New client registration
             let (ak, kek, kdf_params) = self.derive_master_keys()?;
 
-            let mut rng = rand::thread_rng();
-            let static_secret = StaticSecret::random_from_rng(&mut rng);
+            let static_secret = StaticSecret::random();
             let public_key = PublicKey::from(&static_secret);
 
             let encrypted_private_key = encrypt_blob(&static_secret.to_bytes(), &kek);
@@ -608,8 +605,7 @@ impl VaultContext {
                 };
 
                 if !invite_token_b64.is_empty() {
-                    let mut rng = rand::thread_rng();
-                    let static_secret = StaticSecret::random_from_rng(&mut rng);
+                    let static_secret = StaticSecret::random();
                     let public_key = PublicKey::from(&static_secret);
                     let encrypted_private_key = encrypt_blob(&static_secret.to_bytes(), &kek);
 
@@ -702,8 +698,7 @@ impl VaultContext {
                 };
 
                 if !invite_token_b64.is_empty() {
-                    let mut rng = rand::thread_rng();
-                    let static_secret = StaticSecret::random_from_rng(&mut rng);
+                    let static_secret = StaticSecret::random();
                     let public_key = PublicKey::from(&static_secret);
                     let encrypted_private_key = encrypt_blob(&static_secret.to_bytes(), &kek);
 
@@ -759,10 +754,10 @@ impl VaultContext {
     ) -> (String, Vec<u8>) {
         if pt.starts_with(b"RV1") && pt.len() >= 7 {
             let name_len = u32::from_le_bytes(pt[3..7].try_into().unwrap()) as usize;
-            if pt.len() >= 7 + name_len {
-                if let Ok(name_str) = std::str::from_utf8(&pt[7..7 + name_len]) {
-                    return (name_str.to_string(), pt[7 + name_len..].to_vec());
-                }
+            if pt.len() >= 7 + name_len
+                && let Ok(name_str) = std::str::from_utf8(&pt[7..7 + name_len])
+            {
+                return (name_str.to_string(), pt[7 + name_len..].to_vec());
             }
         }
         (cipher_id.to_string(), pt)
@@ -819,7 +814,7 @@ impl VaultContext {
                 collection_key.copy_from_slice(&decrypted_ck);
                 self.collection_keys
                     .insert(collection_name.to_string(), collection_key);
-                return Ok(collection_key);
+                Ok(collection_key)
             } else if let Some(invite) = col.pending_invites.get(&self.clientname) {
                 let invite_token_b64 =
                     std::env::var("RESCILE_VAULT_INVITE_TOKEN").unwrap_or_else(|_| String::new());
@@ -850,8 +845,7 @@ impl VaultContext {
                 let mut collection_key = [0u8; 32];
                 collection_key.copy_from_slice(&collection_key_vec);
 
-                let mut rng = rand::thread_rng();
-                let ephemeral_secret = EphemeralSecret::random_from_rng(&mut rng);
+                let ephemeral_secret = EphemeralSecret::random();
                 let ephemeral_public = PublicKey::from(&ephemeral_secret);
                 let recipient_public = PublicKey::from(static_secret);
                 let shared_secret = ephemeral_secret.diffie_hellman(&recipient_public);
@@ -885,19 +879,16 @@ impl VaultContext {
 
                 self.collection_keys
                     .insert(collection_name.to_string(), collection_key);
-                return Ok(collection_key);
+                Ok(collection_key)
             } else {
-                return Err(
-                    format!("You don't have access to collection '{}'", collection_name).into(),
-                );
+                Err(format!("You don't have access to collection '{}'", collection_name).into())
             }
         } else {
             if collection_name == "default" {
                 let mut collection_key = [0u8; 32];
-                rand::thread_rng().fill_bytes(&mut collection_key);
+                rand::fill(&mut collection_key);
 
-                let mut rng = rand::thread_rng();
-                let ephemeral_secret = EphemeralSecret::random_from_rng(&mut rng);
+                let ephemeral_secret = EphemeralSecret::random();
                 let ephemeral_public = PublicKey::from(&ephemeral_secret);
                 let recipient_public = PublicKey::from(static_secret);
                 let shared_secret = ephemeral_secret.diffie_hellman(&recipient_public);
@@ -933,13 +924,13 @@ impl VaultContext {
 
                 self.collection_keys
                     .insert("default".to_string(), collection_key);
-                return Ok(collection_key);
+                Ok(collection_key)
             } else {
-                return Err(format!(
+                Err(format!(
                     "Collection '{}' not found or you don't have access to it",
                     collection_name
                 )
-                .into());
+                .into())
             }
         }
     }
@@ -951,11 +942,10 @@ impl VaultContext {
         }
 
         let mut collection_key = [0u8; 32];
-        rand::thread_rng().fill_bytes(&mut collection_key);
+        rand::fill(&mut collection_key);
 
         let static_secret = self.static_secret.as_ref().unwrap();
-        let mut rng = rand::thread_rng();
-        let ephemeral_secret = EphemeralSecret::random_from_rng(&mut rng);
+        let ephemeral_secret = EphemeralSecret::random();
         let ephemeral_public = PublicKey::from(&ephemeral_secret);
         let recipient_public = PublicKey::from(static_secret);
         let shared_secret = ephemeral_secret.diffie_hellman(&recipient_public);
@@ -1016,47 +1006,45 @@ impl VaultContext {
 
         if pubkey_resp.status().is_success() {
             let pubkey_b64 = pubkey_resp.text()?;
-            if let Ok(recipient_public_bytes) = B64URL.decode(&pubkey_b64) {
-                if let Ok(recipient_public_bytes_array) =
+            if let Ok(recipient_public_bytes) = B64URL.decode(&pubkey_b64)
+                && let Ok(recipient_public_bytes_array) =
                     <[u8; 32]>::try_from(recipient_public_bytes.as_slice())
-                {
-                    let recipient_public = PublicKey::from(recipient_public_bytes_array);
-                    let mut rng = rand::thread_rng();
-                    let ephemeral_secret = EphemeralSecret::random_from_rng(&mut rng);
-                    let ephemeral_public = PublicKey::from(&ephemeral_secret);
-                    let shared_secret = ephemeral_secret.diffie_hellman(&recipient_public);
-                    let hkdf = hkdf::Hkdf::<sha2::Sha256>::new(None, shared_secret.as_bytes());
-                    let mut wrap_key = [0u8; 32];
-                    hkdf.expand(b"rescile-collection-wrap-v1", &mut wrap_key)
-                        .unwrap();
-                    let wrapped_blob = encrypt_blob(&collection_key, &wrap_key);
-                    let wrapped_key = WrappedKey {
-                        ephemeral_public_key: B64URL.encode(ephemeral_public.as_bytes()),
-                        nonce: wrapped_blob.nonce,
-                        ciphertext: wrapped_blob.ciphertext,
-                        tag: wrapped_blob.tag,
-                    };
+            {
+                let recipient_public = PublicKey::from(recipient_public_bytes_array);
+                let ephemeral_secret = EphemeralSecret::random();
+                let ephemeral_public = PublicKey::from(&ephemeral_secret);
+                let shared_secret = ephemeral_secret.diffie_hellman(&recipient_public);
+                let hkdf = hkdf::Hkdf::<sha2::Sha256>::new(None, shared_secret.as_bytes());
+                let mut wrap_key = [0u8; 32];
+                hkdf.expand(b"rescile-collection-wrap-v1", &mut wrap_key)
+                    .unwrap();
+                let wrapped_blob = encrypt_blob(&collection_key, &wrap_key);
+                let wrapped_key = WrappedKey {
+                    ephemeral_public_key: B64URL.encode(ephemeral_public.as_bytes()),
+                    nonce: wrapped_blob.nonce,
+                    ciphertext: wrapped_blob.ciphertext,
+                    tag: wrapped_blob.tag,
+                };
 
-                    let resp = self
-                        .client
-                        .post(format!(
-                            "{}/vault/v1/collection/{}/invite",
-                            self.base_url, collection_name
-                        ))
-                        .bearer_auth(&self.session.as_ref().unwrap().token)
-                        .json(&serde_json::json!({
-                            "client_id": target_client,
-                            "wrapped_key": wrapped_key,
-                            "expires_at": expires_at,
-                            "role": role,
-                        }))
-                        .send()?;
+                let resp = self
+                    .client
+                    .post(format!(
+                        "{}/vault/v1/collection/{}/invite",
+                        self.base_url, collection_name
+                    ))
+                    .bearer_auth(&self.session.as_ref().unwrap().token)
+                    .json(&serde_json::json!({
+                        "client_id": target_client,
+                        "wrapped_key": wrapped_key,
+                        "expires_at": expires_at,
+                        "role": role,
+                    }))
+                    .send()?;
 
-                    if !resp.status().is_success() {
-                        return Err(format!("Failed to invite client: {}", resp.text()?).into());
-                    }
-                    return Ok(String::new());
+                if !resp.status().is_success() {
+                    return Err(format!("Failed to invite client: {}", resp.text()?).into());
                 }
+                return Ok(String::new());
             }
         }
 
@@ -1077,16 +1065,16 @@ impl VaultContext {
                     invite_secret.copy_from_slice(&decoded);
                     text
                 } else {
-                    rand::thread_rng().fill_bytes(&mut invite_secret);
-                    B64URL.encode(&invite_secret)
+                    rand::fill(&mut invite_secret);
+                    B64URL.encode(invite_secret)
                 }
             } else {
-                rand::thread_rng().fill_bytes(&mut invite_secret);
-                B64URL.encode(&invite_secret)
+                rand::fill(&mut invite_secret);
+                B64URL.encode(invite_secret)
             }
         } else {
-            rand::thread_rng().fill_bytes(&mut invite_secret);
-            B64URL.encode(&invite_secret)
+            rand::fill(&mut invite_secret);
+            B64URL.encode(invite_secret)
         };
 
         let blob = encrypt_blob(&collection_key, &invite_secret);
@@ -1745,45 +1733,55 @@ impl VaultContext {
                                     serde_json::json!({"error": "Not authenticated"}),
                                 ));
                             }
-                            Some(ctx) => {
-                                match ctx.get_state() {
-                                    Ok(mut state) => {
-                                        let clientname = ctx.clientname.clone();
-                                        let collections_copy = state.collections.clone();
-                                        let mut collections: Vec<serde_json::Value> = Vec::new();
-                                        for c in collections_copy {
+                            Some(ctx) => match ctx.get_state() {
+                                Ok(mut state) => {
+                                    let clientname = ctx.clientname.clone();
+                                    let collections_copy = state.collections.clone();
+                                    let mut collections: Vec<serde_json::Value> = Vec::new();
+                                    for c in collections_copy {
+                                        if c.client_access.contains_key(&clientname)
+                                            || c.pending_invites.contains_key(&clientname)
+                                        {
+                                            let mut members: Vec<&String> =
+                                                c.client_access.keys().collect();
+                                            members.sort();
+                                            let mut pending_invitees: Vec<&String> =
+                                                c.pending_invites.keys().collect();
+                                            pending_invitees.sort();
+                                            let mut secrets: Vec<String> = Vec::new();
                                             if c.client_access.contains_key(&clientname)
-                                                || c.pending_invites.contains_key(&clientname)
+                                                && let Ok(collection_key) = ctx
+                                                    .resolve_collection_key(
+                                                        &c.collection_id,
+                                                        &mut state,
+                                                    )
                                             {
-                                                let mut members: Vec<&String> =
-                                                    c.client_access.keys().collect();
-                                                members.sort();
-                                                let mut pending_invitees: Vec<&String> =
-                                                    c.pending_invites.keys().collect();
-                                                pending_invitees.sort();
-                                                let mut secrets: Vec<String> = Vec::new();
-                                                if c.client_access.contains_key(&clientname) {
-                                                    if let Ok(collection_key) = ctx
-                                                        .resolve_collection_key(
-                                                            &c.collection_id,
-                                                            &mut state,
-                                                        )
-                                                    {
-                                                        secrets = state.ciphers.iter()
-                                                        .filter(|cipher| cipher.collection_id == c.collection_id)
-                                                        .map(|cipher| {
-                                                            if let Some(pt) = decrypt_cipher_blob(&cipher.blob, &collection_key) {
-                                                                let (n, _) = ctx.extract_secret_name_and_value(&c.collection_id, &cipher.id, pt);
-                                                                n
-                                                            } else {
-                                                                cipher.id.clone()
-                                                            }
-                                                        })
-                                                        .collect();
-                                                    }
-                                                }
-                                                secrets.sort();
-                                                collections.push(serde_json::json!({
+                                                secrets = state
+                                                    .ciphers
+                                                    .iter()
+                                                    .filter(|cipher| {
+                                                        cipher.collection_id == c.collection_id
+                                                    })
+                                                    .map(|cipher| {
+                                                        if let Some(pt) = decrypt_cipher_blob(
+                                                            &cipher.blob,
+                                                            &collection_key,
+                                                        ) {
+                                                            let (n, _) = ctx
+                                                                .extract_secret_name_and_value(
+                                                                    &c.collection_id,
+                                                                    &cipher.id,
+                                                                    pt,
+                                                                );
+                                                            n
+                                                        } else {
+                                                            cipher.id.clone()
+                                                        }
+                                                    })
+                                                    .collect();
+                                            }
+                                            secrets.sort();
+                                            collections.push(serde_json::json!({
                                                 "name": c.collection_id,
                                                 "has_access": c.client_access.contains_key(&clientname),
                                                 "pending_invite": c.pending_invites.contains_key(&clientname),
@@ -1791,24 +1789,23 @@ impl VaultContext {
                                                 "pending_invitees": pending_invitees,
                                                 "secrets": secrets,
                                             }));
-                                            }
                                         }
-                                        let _ = request.respond(json_response(
-                                            200,
-                                            serde_json::json!({
-                                                "clientname": clientname,
-                                                "collections": collections,
-                                            }),
-                                        ));
                                     }
-                                    Err(e) => {
-                                        let _ = request.respond(json_response(
-                                            500,
-                                            serde_json::json!({"error": format!("{}", e)}),
-                                        ));
-                                    }
+                                    let _ = request.respond(json_response(
+                                        200,
+                                        serde_json::json!({
+                                            "clientname": clientname,
+                                            "collections": collections,
+                                        }),
+                                    ));
                                 }
-                            }
+                                Err(e) => {
+                                    let _ = request.respond(json_response(
+                                        500,
+                                        serde_json::json!({"error": format!("{}", e)}),
+                                    ));
+                                }
+                            },
                         }
                     }
                     (Method::Post, "/api/collection") => {
@@ -2114,8 +2111,8 @@ impl VaultContext {
 
     fn cmd_reset_client(&mut self, target_client: &str) -> Result<String, Box<dyn Error>> {
         let mut reset_secret = [0u8; 32];
-        rand::thread_rng().fill_bytes(&mut reset_secret);
-        let token_b64 = B64URL.encode(&reset_secret);
+        rand::fill(&mut reset_secret);
+        let token_b64 = B64URL.encode(reset_secret);
 
         let resp = self
             .client
@@ -2227,4 +2224,43 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut ctx = VaultContext::new(cli.clone());
     ctx.run_command(cli.command)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn generated_password_contains_each_character_class() {
+        for len in [0, 4, 32] {
+            let password = generate_random_password(len);
+            assert_eq!(password.len(), if len < 4 { 16 } else { len });
+            assert!(password.bytes().any(|b| b.is_ascii_uppercase()));
+            assert!(password.bytes().any(|b| b.is_ascii_lowercase()));
+            assert!(password.bytes().any(|b| b.is_ascii_digit()));
+            assert!(password.bytes().any(|b| b"!@#$%^&*".contains(&b)));
+        }
+    }
+
+    #[test]
+    fn generated_x25519_secrets_agree() {
+        let static_secret = StaticSecret::random();
+        let ephemeral_secret = EphemeralSecret::random();
+        let static_public = PublicKey::from(&static_secret);
+        let ephemeral_public = PublicKey::from(&ephemeral_secret);
+
+        assert_eq!(
+            static_secret.diffie_hellman(&ephemeral_public).as_bytes(),
+            ephemeral_secret.diffie_hellman(&static_public).as_bytes()
+        );
+    }
+
+    #[test]
+    fn random_nonce_blob_round_trips() {
+        let mut key = [0u8; 32];
+        rand::fill(&mut key);
+        let plaintext = b"secret";
+        let blob = encrypt_blob(plaintext, &key);
+        assert_eq!(decrypt_blob(&blob, &key).unwrap(), plaintext);
+    }
 }

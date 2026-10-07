@@ -157,6 +157,8 @@ nix-shell                  # drops you into the dev shell with rustup, zig, node
 just                       # list all recipes
 just build                 # cargo build --release
 just build-static          # static musl build via Zig
+just fmt                   # cargo fmt --all -- --check
+just clippy                # cargo clippy --all-targets -- -D warnings
 just test                  # cargo test
 just install               # build-static + install to /usr/local/bin
 ```

@@ -18,7 +18,36 @@ env:
   CARGO_INCREMENTAL: '0'
 
 jobs:
+  build-ui:
+    name: Build frontend UI
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+
+      - name: Build frontend
+        working-directory: ui
+        run: |
+          npm ci
+          npm run build
+
+      - name: Upload frontend dist
+        uses: actions/upload-artifact@v6
+        with:
+          name: frontend-dist
+          path: ui/dist/
+          if-no-files-found: error
+          retention-days: 1
+
   build:
+    needs: build-ui
     name: Build ${{ matrix.name }}
     # Pinned to 22.04 so the gnu-tpm binary's glibc floor is 2.35, giving us
     # broader distro compatibility than the latest runner image.
@@ -46,7 +75,13 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
+
+      - name: Download frontend dist
+        uses: actions/download-artifact@v7
+        with:
+          name: frontend-dist
+          path: ui/dist/
 
       - name: Resolve tag
         id: tag
@@ -66,7 +101,7 @@ jobs:
           rustup default stable
 
       - name: Cache cargo registry & build
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/registry
@@ -80,9 +115,12 @@ jobs:
 
       - name: Install Zig
         if: matrix.build_tool == 'zigbuild'
-        uses: mlugg/setup-zig@v2
-        with:
-          version: 0.13.0
+        run: |
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/zig.tar.xz" \
+            https://ziglang.org/download/0.13.0/zig-linux-x86_64-0.13.0.tar.xz
+          echo 'd45312e61ebcc48032b77bc4cf7fd6915c11fa16e4aad116b66c9468211230ea  '"$RUNNER_TEMP/zig.tar.xz" | sha256sum -c -
+          tar -xJf "$RUNNER_TEMP/zig.tar.xz" -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/zig-linux-x86_64-0.13.0" >> "$GITHUB_PATH"
 
       - name: Install cargo-zigbuild
         if: matrix.build_tool == 'zigbuild'
@@ -103,7 +141,7 @@ jobs:
       - name: Cache static tpm2-tss
         if: matrix.build_tpm2_tss_static
         id: cache-tpm2-tss
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: /opt/tpm2-tss
           key: tpm2-tss-static-4.1.3-${{ runner.os }}-v1
@@ -135,19 +173,6 @@ jobs:
           # Tell pkg-config to emit transitive private deps so static linking
           # resolves everything (json-c, crypto, etc.).
           echo "PKG_CONFIG_ALL_STATIC=1" >> "$GITHUB_ENV"
-
-      - name: Set up Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-          cache: 'npm'
-          cache-dependency-path: ui/package-lock.json
-
-      - name: Build frontend
-        working-directory: ui
-        run: |
-          npm ci
-          npm run build
 
       - name: Build binary (zigbuild / musl)
         if: matrix.build_tool == 'zigbuild'
@@ -199,9 +224,9 @@ jobs:
           echo "asset=${ASSET}" >> "$GITHUB_OUTPUT"
 
       - name: Upload build artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
-          name: ${{ matrix.name }}
+          name: binary-${{ matrix.name }}
           path: dist/*
           if-no-files-found: error
           retention-days: 7
@@ -223,9 +248,10 @@ jobs:
           fi
           echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
 
-      - name: Download all artifacts
-        uses: actions/download-artifact@v4
+      - name: Download binary artifacts
+        uses: actions/download-artifact@v7
         with:
+          pattern: binary-*
           path: artifacts
           merge-multiple: true
 
@@ -240,7 +266,7 @@ jobs:
           cat checksums.txt
 
       - name: Upload assets to release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ steps.tag.outputs.tag }}
           files: |
@@ -250,7 +276,7 @@ jobs:
           # this action just appends the assets and leaves the body alone.
 
       - name: Checkout tag
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           ref: ${{ steps.tag.outputs.tag }}
           path: _repo_checkout
@@ -263,7 +289,7 @@ jobs:
           git push origin latest --force
 
       - name: Upload assets to latest release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: latest
           make_latest: false
