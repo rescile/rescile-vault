@@ -22,6 +22,7 @@ git -C "$checkout/source" checkout --quiet --detach "$(git rev-parse HEAD)"
 if cmp -s "$binary" "$checkout/source/$binary"; then
     sha256sum "$binary"
     echo 'Release binaries match.'
+    rm -rf "$checkout"
 else
     sha256sum "$binary" "$checkout/source/$binary"
     echo "Release binaries differ. Compare with: diffoscope '$binary' '$checkout/source/$binary'" >&2

@@ -39,10 +39,12 @@ build-release profile="release-musl":
     rustup target add "$target"
     export RESCILE_RELEASE_CHANNEL="${RESCILE_RELEASE_CHANNEL:-developer-build}"
     export SOURCE_DATE_EPOCH="$(git log -1 --format=%ct HEAD)"
+    export RUSTC_WRAPPER="$PWD/scripts/rustc-release-wrapper.sh"
+    export NIX_LDFLAGS="$(echo "${NIX_LDFLAGS:-}" | sed "s|-rpath $PWD[^ ]*||g")"
     if [[ "$target" == *-musl ]]; then
-        export CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_RUSTFLAGS="${CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_RUSTFLAGS:-} --remap-path-prefix=$PWD=/src"
+        export CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_RUSTFLAGS="${CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_RUSTFLAGS:-} -C target-cpu=x86-64-v2"
     else
-        export RUSTFLAGS="${RUSTFLAGS:-} --remap-path-prefix=$PWD=/src"
+        export RUSTFLAGS="${RUSTFLAGS:-} -C target-cpu=x86-64-v2"
     fi
     npm ci --prefix ui --no-audit --no-fund
     npm run build --prefix ui

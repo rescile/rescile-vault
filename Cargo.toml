@@ -31,3 +31,11 @@ mime_guess = "2.0.5"
 [features]
 openssl-vendored = ["openssl-sys/vendored"]
 tpm = ["tss-esapi"]
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+strip = true
+overflow-checks = true
+panic = "unwind"
+
