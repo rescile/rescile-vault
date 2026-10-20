@@ -2,4 +2,5 @@
 .direnv/
 .rustup/
 target/
+/dist/
 node_modules/

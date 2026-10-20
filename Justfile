@@ -7,7 +7,7 @@ name := "rescile-vault"
 
 # Output directory for release binaries
 out_dir := "target/release"
-static_out_dir := "target/x86_64-unknown-linux-musl/release"
+static_out_dir := "target/nix-release-musl/x86_64-unknown-linux-musl/release"
 
 # ==============================================================================
 # DEVELOPMENT
@@ -24,32 +24,64 @@ build:
     @cargo build --release
     @echo "Build complete. Binary created in {{out_dir}}/"
 
-# Build the rescile-vault binary in static release mode for linux (musl)
-build-static:
+# Local and CI builds use the same pinned Nix release shell and checks.
+build-release profile="release-musl":
     #!/usr/bin/env bash
     set -euo pipefail
+    if [[ "${RESCILE_RELEASE_PROFILE:-}" != "{{profile}}" ]]; then
+        exec nix develop --no-update-lock-file .#{{profile}} --command just build-release {{profile}}
+    fi
+    case "{{profile}}" in
+        release-musl) target=x86_64-unknown-linux-musl ;;
+        release-gnu-tpm) target=x86_64-unknown-linux-gnu ;;
+        *) echo "Unknown release profile: {{profile}}" >&2; exit 1 ;;
+    esac
+    rustup target add "$target"
+    export RESCILE_RELEASE_CHANNEL="${RESCILE_RELEASE_CHANNEL:-developer-build}"
+    export SOURCE_DATE_EPOCH="$(git log -1 --format=%ct HEAD)"
+    if [[ "$target" == *-musl ]]; then
+        export CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_RUSTFLAGS="${CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_RUSTFLAGS:-} --remap-path-prefix=$PWD=/src"
+    else
+        export RUSTFLAGS="${RUSTFLAGS:-} --remap-path-prefix=$PWD=/src"
+    fi
+    npm ci --prefix ui --no-audit --no-fund
+    npm run build --prefix ui
+    SKIP_FRONTEND_BUILD=1 cargo build --release --locked --target "$target" --features tpm
+    binary="${CARGO_TARGET_DIR:-target}/$target/release/rescile-vault"
+    strip "$binary"
+    if readelf -l "$binary" | grep -q INTERP || readelf -d "$binary" | grep -q NEEDED; then
+        echo "Not a static {{profile}} binary: $binary" >&2; exit 1
+    fi
+    "$binary" --help | grep -q -- '--tpm'
+    "$binary" --version
 
-    # Revert Cargo.toml on exit to restore the original version.
-    trap 'sed -i "s/version = \"${new_version}\"/version = \"${current_version}\"/" Cargo.toml' EXIT
+package-release profile="release-musl":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    case "{{profile}}" in
+        release-musl) target=x86_64-unknown-linux-musl; asset=x86_64-linux-musl ;;
+        release-gnu-tpm) target=x86_64-unknown-linux-gnu; asset=x86_64-linux-gnu-tpm ;;
+        *) echo "Unknown release profile: {{profile}}" >&2; exit 1 ;;
+    esac
+    binary="target/nix-{{profile}}/$target/release/rescile-vault"
+    name="rescile-vault-$asset"
+    mkdir -p dist
+    cp "$binary" "dist/$name"
+    (cd dist && sha256sum "$name" > "$name.sha256")
 
-    # Read current version from Cargo.toml and increment the patch number
-    current_version=$(grep '^version = ' Cargo.toml | sed -E 's/version = "(.+)"/\1/')
-    major_minor=$(echo "$current_version" | cut -d. -f1-2)
-    patch=$(echo "$current_version" | cut -d. -f3)
-    new_patch=$((patch + 1))
-    new_version="${major_minor}.${new_patch}+$(date +%Y%m%d%H%M%S)"
+verify-release-repro profile="release-musl":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    case "{{profile}}" in
+        release-musl) target=x86_64-unknown-linux-musl ;;
+        release-gnu-tpm) target=x86_64-unknown-linux-gnu ;;
+        *) echo "Unknown release profile: {{profile}}" >&2; exit 1 ;;
+    esac
+    bash scripts/verify-release-repro.sh {{profile}} "target/nix-{{profile}}/$target/release/rescile-vault"
 
-    echo "==> Preparing developer build..."
-    echo "    -> Temporarily setting version to ${new_version}"
-    sed -i "s/version = \"${current_version}\"/version = \"${new_version}\"/" Cargo.toml
+build-static: (build-release "release-musl")
 
-    # Set the release channel for the build, which the binary will embed
-    export RESCILE_RELEASE_CHANNEL="developer-build"
-
-    echo "    -> Building static '{{name}}' (developer build for x86_64-unknown-linux-musl)..."
-    cargo build --release --target x86_64-unknown-linux-musl --features openssl-vendored
-    echo "==> Developer build complete. Version reverted in Cargo.toml."
-    echo "    Binary is available at: {{static_out_dir}}/{{name}}"
+build-gnu-tpm: (build-release "release-gnu-tpm")
 
 # Check Rust formatting
 fmt:
@@ -63,6 +95,22 @@ clippy:
 test:
     @echo "Running tests..."
     @cargo test
+
+# Refresh Cargo/npm lockfiles within existing manifest ranges and advance nixos-unstable.
+dependency-update:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cargo update
+    (cd ui && npm update --package-lock-only --ignore-scripts --no-audit --no-fund)
+    nix flake update nixpkgs
+
+# Upgrade Cargo/npm manifest requirements (including majors) and regenerate locks.
+dependency-upgrade:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cargo upgrade --incompatible allow
+    (cd ui && npx --yes npm-check-updates@23 --upgrade --target latest)
+    just dependency-update
 
 # Clean build artifacts and packaged tarballs
 clean:
@@ -144,81 +192,11 @@ release new_version:
     echo "    After the PR is merged, the release can be finalized by running:"
     echo "    just mark-release ${NEW_VERSION} <pre|release>"
 
+# No standalone vault Nix package exists; Linux binaries are released through flake shells.
+# Retain a clear error for existing callers instead of silently skipping work.
 nix-release new_version:
-    #!/usr/bin/env bash
-    set -euo pipefail
-
-    # --- Variables ---
-    NEW_VERSION="{{new_version}}"
-    VERSION_TAG="v{{new_version}}"
-    NIX_PKG_DIR="nix/pkgs/{{name}}"
-    PACKAGE_NIX_FILE="${NIX_PKG_DIR}/package.nix"
-    PACKAGE_TGZ="{{name}}-${NEW_VERSION}.tgz"
-
-    # --- Pre-flight Checks ---
-    if [[ -z "${NEW_VERSION}" ]]; then
-        echo "❌ ERROR: Version argument is mandatory." >&2
-        echo "Usage: just release <VERSION>" >&2
-        exit 1
-    fi
-    
-    if [ ! -f "${PACKAGE_NIX_FILE}" ]; then
-        echo "ℹ️  No package.nix found at ${PACKAGE_NIX_FILE}. Skipping Nix release steps."
-        exit 0
-    fi
-
-    echo "==> Nix Release version '${VERSION_TAG}'..."
-
-    # Step 2: Create a source tarball that includes the updated Cargo.toml
-    echo "    -> Creating source tarball ${PACKAGE_TGZ}..."
-    PREFIX="{{name}}-${NEW_VERSION}"
-    git ls-files | tar -czf "${PACKAGE_TGZ}" --transform="s,^,${PREFIX}/," -T -
-
-     # Step 3: Update Nix package definition
-    echo "    -> Updating Nix package definition..."
-    sed -i -E "s/(version = \")[^\"]+/\1${NEW_VERSION}/" "${PACKAGE_NIX_FILE}"
-    sed -i -E "s|({{name}}-)[^\"]+(\.tgz\")|\1${NEW_VERSION}\2|" "${PACKAGE_NIX_FILE}"
-    cp "${PACKAGE_TGZ}" "${NIX_PKG_DIR}/"
-
-    echo "    -> Calculating new src hash..."
-    SRC_HASH=$(nix-prefetch-url --type sha256 "file://$(pwd)/${NIX_PKG_DIR}/${PACKAGE_TGZ}" | xargs nix hash convert --hash-algo sha256 --from nix32 --to sri)
-    if [[ -z "$SRC_HASH" ]]; then
-        echo "    -> ERROR: Could not calculate src hash for '${PACKAGE_TGZ}'." >&2; git checkout -- Cargo.toml; exit 1
-    fi
-    sed -i -E "s|hash = \\\".*\\\";|hash = \\\"${SRC_HASH}\\\";|" "${PACKAGE_NIX_FILE}"
-
-    DUMMY_HASH="sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
-    sed -i -E "s|cargoHash = \\\".*\\\";|cargoHash = \\\"${DUMMY_HASH}\\\";|" "${PACKAGE_NIX_FILE}"
-
-    echo "    -> Calculating cargoHash (this will show a build error, which is expected)..."
-    BUILD_OUTPUT=$(nix-build --no-out-link --expr "(import <nixpkgs> {}).callPackage ./${PACKAGE_NIX_FILE} {}" 2>&1 || true)
-    CARGO_HASH=$(echo "${BUILD_OUTPUT}" | grep -E '(got:|observed:)' | grep -oE 'sha256-[-A-Za-z0-9+/=]+' | tail -n 1)
-
-    if [[ -z "$CARGO_HASH" ]]; then
-        echo "    -> ERROR: Could not determine cargoHash." >&2
-        echo "    -> Full build output:" >&2; echo "${BUILD_OUTPUT}" >&2
-        git checkout -- Cargo.toml "${PACKAGE_NIX_FILE}"; exit 1
-    fi
-    sed -i -E "s|cargoHash = \\\".*\\\";|cargoHash = \\\"${CARGO_HASH}\\\";|" "${PACKAGE_NIX_FILE}"
-    echo "    -> Updated Nix package with src hash and cargoHash."
-
-    # Step 4: Verify the Nix build is successful
-    echo "    -> Verifying Nix build..."
-    if ! nix-build --no-out-link --expr "(import <nixpkgs> {}).callPackage ./${PACKAGE_NIX_FILE} {}" >/dev/null; then
-        echo "    -> ERROR: Nix build failed even after updating hashes." >&2
-        git checkout -- Cargo.toml "${PACKAGE_NIX_FILE}"; exit 1
-    fi
-    echo "    -> Nix build successful!"
-
-    # Step 5: Commit the changes
-    echo "    -> Committing release files..."
-    git add -u "${PACKAGE_NIX_FILE}"
-    git add "${NIX_PKG_DIR}/${PACKAGE_TGZ}"
-    git commit -m "Nix Release ${VERSION_TAG}"
-
-    echo
-    echo "✅ Nix release for '${VERSION_TAG}' created successfully!"
-    echo "    Next, push this branch and create a pull request."
+    @echo "No standalone vault Nix package; use the flake-backed GitHub release workflow for v{{new_version}}" >&2
+    @exit 1
 
 
 # Tag the current HEAD for a release and push to upstream, triggering the GitHub release workflow.

@@ -31,8 +31,8 @@ asset for your platform:
 
 | Asset | Target | Notes |
 |---|---|---|
-| `rescile-vault-vX.Y.Z-x86_64-linux-musl` | `x86_64-unknown-linux-musl` | Fully static. Recommended. |
-| `rescile-vault-vX.Y.Z-x86_64-linux-gnu-tpm` | `x86_64-unknown-linux-gnu` + `tpm` | Includes TPM 2.0 support. tpm2-tss is statically linked from source; only glibc remains a dynamic dep. |
+| `rescile-vault-vX.Y.Z-x86_64-linux-musl` | `x86_64-unknown-linux-musl` + `tpm` | Fully static, with TPM 2.0 support. Recommended. |
+| `rescile-vault-vX.Y.Z-x86_64-linux-gnu-tpm` | `x86_64-unknown-linux-gnu` + `tpm` | Fully static GNU build with TPM 2.0 support. |
 
 ```sh
 # Replace VERSION with the release you want
@@ -58,20 +58,21 @@ runs `npm install && npm run build` in `ui/` and embeds the result).
 cargo build --release
 ```
 
-For a fully static Linux binary (matches the CI release artifacts), use the
-Justfile recipe — it uses Zig as the C linker and enables the
-`openssl-vendored` feature:
+For a fully static Linux binary with TPM support (matching the CI release
+artifact), use the pinned flake release shell. Nix supplies musl OpenSSL and
+statically linked `tpm2-tss` libraries:
 
 ```sh
-just build-static
-# Output: target/x86_64-unknown-linux-musl/release/rescile-vault
+nix develop .#release-musl --command just build-release release-musl
+# or: just build-static
+# Output: target/nix-release-musl/x86_64-unknown-linux-musl/release/rescile-vault
 ```
 
 Optional features:
 
 | Feature | Effect |
 |---|---|
-| `openssl-vendored` | Build a vendored OpenSSL — required for the static musl build. |
+| `openssl-vendored` | Build a vendored OpenSSL; flake release profiles instead use pinned Nix OpenSSL. |
 | `tpm` | Enable TPM 2.0 unlock (`--tpm` flag). Pulls in `tss-esapi`. |
 
 ## Usage
@@ -151,17 +152,29 @@ member's public key.
 
 ```sh
 # Nix users
-nix-shell                  # drops you into the dev shell with rustup, zig, node, etc.
+nix develop                # default development shell; .envrc also uses this flake
 
 # Common tasks
 just                       # list all recipes
 just build                 # cargo build --release
-just build-static          # static musl build via Zig
+just build-static          # pinned static musl + TPM build
+just build-gnu-tpm         # pinned static GNU + TPM build
+just verify-release-repro release-musl  # compare two clean-checkout builds
+just verify-release-repro release-gnu-tpm
+just package-release release-musl       # CI asset and checksum
 just fmt                   # cargo fmt --all -- --check
 just clippy                # cargo clippy --all-targets -- -D warnings
 just test                  # cargo test
+just dependency-update     # refresh Cargo/npm locks and nixos-unstable flake.lock
+just dependency-upgrade    # upgrade manifest ranges and refresh locks
 just install               # build-static + install to /usr/local/bin
 ```
+
+Release builds rebuild the locked UI and derive timestamps from the commit. Set `RESCILE_RELEASE_CHANNEL` to the CI release channel to match bytes. Reproducibility checks need a clean checkout with committed `flake.nix` and `flake.lock`; ordinary `just build` is not equivalent to a release build.
+
+Run dependency recipes inside `nix develop` (or direnv with `use flake`).
+Both update `flake.lock` on `nixos-unstable`; `dependency-upgrade` also permits
+major Cargo/npm manifest changes. Review and test all changes before committing.
 
 ### Cutting a release
 
