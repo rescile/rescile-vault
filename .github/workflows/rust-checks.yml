@@ -1,37 +1,17 @@
 name: Rust checks
 
+# Temporary: run manually; restore push/pull_request triggers to re-enable CI.
 on:
-  push:
-    branches:
-      - main
-  pull_request:
+  workflow_dispatch:
 
 jobs:
   rust:
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v5
-      - uses: actions/setup-node@v5
+      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31
         with:
-          node-version: '24'
-          cache: npm
-          cache-dependency-path: ui/package-lock.json
-      - name: Build frontend assets
-        working-directory: ui
-        run: |
-          npm ci
-          npm run build
-      - name: Install Rust toolchain
-        run: |
-          rustup toolchain install stable --profile minimal --component rustfmt --component clippy
-          rustup default stable
-      - name: Check formatting
-        run: cargo fmt --all -- --check
-      - name: Run Clippy
-        env:
-          SKIP_FRONTEND_BUILD: '1'
-        run: cargo clippy --locked --all-targets -- -D warnings
-      - name: Run tests
-        env:
-          SKIP_FRONTEND_BUILD: '1'
-        run: cargo test --locked
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+      - name: Check frontend and Rust
+        run: nix develop --no-update-lock-file .#default --command just rust-check

@@ -3,8 +3,9 @@
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
 
   outputs = { self, nixpkgs }: {
-    devShells.x86_64-linux = import ./nix/shells.nix {
-      pkgs = nixpkgs.legacyPackages.x86_64-linux;
-    };
+    devShells = builtins.listToAttrs (map (system: {
+      name = system;
+      value = import ./nix/shells.nix { pkgs = nixpkgs.legacyPackages.${system}; };
+    }) [ "x86_64-linux" "aarch64-linux" ]);
   };
 }

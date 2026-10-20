@@ -1,7 +1,11 @@
 { pkgs }:
 let
-  musl = pkgs.pkgsCross.musl64;
+  arch = if pkgs.stdenv.hostPlatform.isAarch64 then "aarch64" else "x86_64";
+  target = "${arch}-unknown-linux-musl";
+  envTarget = pkgs.lib.toUpper (builtins.replaceStrings [ "-" ] [ "_" ] target);
+  musl = if arch == "aarch64" then pkgs.pkgsStatic else pkgs.pkgsCross.musl64;
   muslCC = musl.stdenv.cc;
+  linker = "${muslCC}/bin/${muslCC.targetPrefix}gcc";
   muslAR = muslCC.bintools;
   muslOpenSSL = musl.openssl.override { static = true; };
   staticTss = openssl: json: tss: tss.overrideAttrs (old: {
@@ -14,8 +18,6 @@ let
     ];
   });
   muslTss = staticTss muslOpenSSL musl.json_c musl.tpm2-tss;
-  gnuOpenSSL = pkgs.openssl.override { static = true; };
-  gnuTss = staticTss gnuOpenSSL pkgs.json_c pkgs.tpm2-tss;
   common = [
     pkgs.rustup pkgs.cargo-edit pkgs.just pkgs.git pkgs.gh pkgs.jq pkgs.python3
     pkgs.nodejs_24 pkgs.pkg-config pkgs.binutils pkgs.file pkgs.coreutils
@@ -28,7 +30,7 @@ let
 in
 {
   default = pkgs.mkShell {
-    packages = common;
+    packages = common ++ [ pkgs.openssl pkgs.openssl.dev ];
     shellHook = localHomes;
   };
   frontend = pkgs.mkShell {
@@ -37,36 +39,23 @@ in
   release-tools = pkgs.mkShell {
     packages = [ pkgs.coreutils pkgs.findutils pkgs.git pkgs.just pkgs.gh ];
   };
-  release-musl = pkgs.mkShell {
+  release-musl = pkgs.mkShell ({
     packages = common ++ [ muslCC muslAR muslTss muslTss.dev muslOpenSSL muslOpenSSL.dev musl.json_c ];
     CARGO_TARGET_DIR = "target/nix-release-musl";
-    CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER = "${muslCC}/bin/${muslCC.targetPrefix}gcc";
-    CC_x86_64_unknown_linux_musl = "${muslCC}/bin/${muslCC.targetPrefix}gcc";
-    AR_x86_64_unknown_linux_musl = "${muslAR}/bin/${muslAR.targetPrefix}ar";
-    PKG_CONFIG_ALLOW_CROSS_x86_64_unknown_linux_musl = "1";
-    PKG_CONFIG_LIBDIR_x86_64_unknown_linux_musl =
-      "${muslTss.dev}/lib/pkgconfig:${muslOpenSSL.dev}/lib/pkgconfig:${musl.json_c.dev}/lib/pkgconfig";
-    X86_64_UNKNOWN_LINUX_MUSL_OPENSSL_STATIC = "1";
-    X86_64_UNKNOWN_LINUX_MUSL_OPENSSL_LIB_DIR = "${muslOpenSSL.out}/lib";
-    X86_64_UNKNOWN_LINUX_MUSL_OPENSSL_INCLUDE_DIR = "${muslOpenSSL.dev}/include";
-    CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_RUSTFLAGS =
-      "-L native=${muslTss.out}/lib -l static=tss2-tcti-device -l static=tss2-tcti-swtpm -C link-arg=${muslTss.out}/lib/libtss2-sys.a -C link-arg=${muslTss.out}/lib/libtss2-mu.a";
+    RESCILE_RELEASE_TARGET = target;
     RESCILE_RELEASE_PROFILE = "release-musl";
     shellHook = localHomes;
-  };
-  release-gnu-tpm = pkgs.mkShell {
-    packages = common ++ [ pkgs.stdenv.cc gnuTss gnuTss.dev gnuOpenSSL gnuOpenSSL.dev pkgs.json_c ];
-    CARGO_TARGET_DIR = "target/nix-release-gnu-tpm";
-    LIBRARY_PATH = "${pkgs.glibc.static}/lib";
-    PKG_CONFIG_ALL_STATIC = "1";
-    PKG_CONFIG_PATH = "${gnuTss.dev}/lib/pkgconfig:${gnuOpenSSL.dev}/lib/pkgconfig:${pkgs.json_c.dev}/lib/pkgconfig";
-    OPENSSL_STATIC = "1";
-    OPENSSL_LIB_DIR = "${gnuOpenSSL.out}/lib";
-    OPENSSL_INCLUDE_DIR = "${gnuOpenSSL.dev}/include";
-    RESCILE_RELEASE_PROFILE = "release-gnu-tpm";
-    shellHook = ''
-      ${localHomes}
-      export RUSTFLAGS="-C target-feature=+crt-static -L native=${gnuTss.out}/lib -l static=tss2-tcti-device -l static=tss2-tcti-swtpm -C link-arg=${gnuTss.out}/lib/libtss2-sys.a -C link-arg=${gnuTss.out}/lib/libtss2-mu.a"
-    '';
-  };
+  } // builtins.listToAttrs [
+    { name = "CARGO_TARGET_${envTarget}_LINKER"; value = linker; }
+    { name = "CC_${builtins.replaceStrings [ "-" ] [ "_" ] target}"; value = linker; }
+    { name = "AR_${builtins.replaceStrings [ "-" ] [ "_" ] target}"; value = "${muslAR}/bin/${muslAR.targetPrefix}ar"; }
+    { name = "PKG_CONFIG_ALLOW_CROSS_${builtins.replaceStrings [ "-" ] [ "_" ] target}"; value = "1"; }
+    { name = "PKG_CONFIG_LIBDIR_${builtins.replaceStrings [ "-" ] [ "_" ] target}"; value =
+        "${muslTss.dev}/lib/pkgconfig:${muslOpenSSL.dev}/lib/pkgconfig:${musl.json_c.dev}/lib/pkgconfig"; }
+    { name = "${envTarget}_OPENSSL_STATIC"; value = "1"; }
+    { name = "${envTarget}_OPENSSL_LIB_DIR"; value = "${muslOpenSSL.out}/lib"; }
+    { name = "${envTarget}_OPENSSL_INCLUDE_DIR"; value = "${muslOpenSSL.dev}/include"; }
+    { name = "CARGO_TARGET_${envTarget}_RUSTFLAGS"; value =
+        "-L native=${muslTss.out}/lib -l static=tss2-tcti-device -l static=tss2-tcti-swtpm -C link-arg=${muslTss.out}/lib/libtss2-sys.a -C link-arg=${muslTss.out}/lib/libtss2-mu.a"; }
+  ]);
 }

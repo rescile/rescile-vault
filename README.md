@@ -31,14 +31,14 @@ asset for your platform:
 
 | Asset | Target | Notes |
 |---|---|---|
-| `rescile-vault-vX.Y.Z-x86_64-linux-musl` | `x86_64-unknown-linux-musl` + `tpm` | Fully static, with TPM 2.0 support. Recommended. |
-| `rescile-vault-vX.Y.Z-x86_64-linux-gnu-tpm` | `x86_64-unknown-linux-gnu` + `tpm` | Fully static GNU build with TPM 2.0 support. |
+| `rescile-vault-x86_64-linux-musl` | `x86_64-unknown-linux-musl` + `tpm` | Fully static, with TPM 2.0 support. |
+| `rescile-vault-aarch64-linux-musl` | `aarch64-unknown-linux-musl` + `tpm` | Fully static, with TPM 2.0 support. |
 
 ```sh
 # Replace VERSION with the release you want
 VERSION=v0.1.0
 curl -L -o rescile-vault \
-  "https://github.com/rescile/rescile-vault/releases/download/${VERSION}/rescile-vault-${VERSION}-x86_64-linux-musl"
+  "https://github.com/rescile/rescile-vault/releases/download/${VERSION}/rescile-vault-x86_64-linux-musl"
 chmod +x rescile-vault
 sudo mv rescile-vault /usr/local/bin/
 ```
@@ -65,7 +65,7 @@ statically linked `tpm2-tss` libraries:
 ```sh
 nix develop .#release-musl --command just build-release release-musl
 # or: just build-static
-# Output: target/nix-release-musl/x86_64-unknown-linux-musl/release/rescile-vault
+# Output: target/nix-release-musl/<host-arch>-unknown-linux-musl/release/rescile-vault
 ```
 
 Optional features:
@@ -158,9 +158,7 @@ nix develop                # default development shell; .envrc also uses this fl
 just                       # list all recipes
 just build                 # cargo build --release
 just build-static          # pinned static musl + TPM build
-just build-gnu-tpm         # pinned static GNU + TPM build
 just verify-release-repro release-musl  # compare two clean-checkout builds
-just verify-release-repro release-gnu-tpm
 just package-release release-musl       # CI asset and checksum
 just fmt                   # cargo fmt --all -- --check
 just clippy                # cargo clippy --all-targets -- -D warnings

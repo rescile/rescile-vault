@@ -28,23 +28,20 @@ build:
 build-release profile="release-musl":
     #!/usr/bin/env bash
     set -euo pipefail
-    if [[ "${RESCILE_RELEASE_PROFILE:-}" != "{{profile}}" ]]; then
-        exec nix develop --no-update-lock-file .#{{profile}} --command just build-release {{profile}}
+    if [[ "{{profile}}" != release-musl ]]; then
+        echo "Unknown release profile: {{profile}}" >&2; exit 1
     fi
-    case "{{profile}}" in
-        release-musl) target=x86_64-unknown-linux-musl ;;
-        release-gnu-tpm) target=x86_64-unknown-linux-gnu ;;
-        *) echo "Unknown release profile: {{profile}}" >&2; exit 1 ;;
-    esac
+    if [[ "${RESCILE_RELEASE_PROFILE:-}" != release-musl ]]; then
+        exec nix develop --no-update-lock-file .#release-musl --command just build-release release-musl
+    fi
+    target="${RESCILE_RELEASE_TARGET:?release shell must set target}"
     rustup target add "$target"
     export RESCILE_RELEASE_CHANNEL="${RESCILE_RELEASE_CHANNEL:-developer-build}"
     export SOURCE_DATE_EPOCH="$(git log -1 --format=%ct HEAD)"
     export RUSTC_WRAPPER="$PWD/scripts/rustc-release-wrapper.sh"
     export NIX_LDFLAGS="$(echo "${NIX_LDFLAGS:-}" | sed "s|-rpath $PWD[^ ]*||g")"
-    if [[ "$target" == *-musl ]]; then
+    if [[ "$target" == x86_64-unknown-linux-musl ]]; then
         export CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_RUSTFLAGS="${CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_RUSTFLAGS:-} -C target-cpu=x86-64-v2"
-    else
-        export RUSTFLAGS="${RUSTFLAGS:-} -C target-cpu=x86-64-v2"
     fi
     npm ci --prefix ui --no-audit --no-fund
     npm run build --prefix ui
@@ -52,7 +49,7 @@ build-release profile="release-musl":
     binary="${CARGO_TARGET_DIR:-target}/$target/release/rescile-vault"
     strip "$binary"
     if readelf -l "$binary" | grep -q INTERP || readelf -d "$binary" | grep -q NEEDED; then
-        echo "Not a static {{profile}} binary: $binary" >&2; exit 1
+        echo "Not a static musl binary: $binary" >&2; exit 1
     fi
     "$binary" --help | grep -q -- '--tpm'
     "$binary" --version
@@ -60,13 +57,16 @@ build-release profile="release-musl":
 package-release profile="release-musl":
     #!/usr/bin/env bash
     set -euo pipefail
-    case "{{profile}}" in
-        release-musl) target=x86_64-unknown-linux-musl; asset=x86_64-linux-musl ;;
-        release-gnu-tpm) target=x86_64-unknown-linux-gnu; asset=x86_64-linux-gnu-tpm ;;
-        *) echo "Unknown release profile: {{profile}}" >&2; exit 1 ;;
+    if [[ "{{profile}}" != release-musl ]]; then
+        echo "Unknown release profile: {{profile}}" >&2; exit 1
+    fi
+    arch=$(uname -m)
+    case "$arch" in
+        x86_64|aarch64) ;;
+        *) echo "Unsupported release architecture: $arch" >&2; exit 1 ;;
     esac
-    binary="target/nix-{{profile}}/$target/release/rescile-vault"
-    name="rescile-vault-$asset"
+    binary="target/nix-release-musl/${arch}-unknown-linux-musl/release/rescile-vault"
+    name="rescile-vault-${arch}-linux-musl"
     mkdir -p dist
     cp "$binary" "dist/$name"
     (cd dist && sha256sum "$name" > "$name.sha256")
@@ -74,16 +74,22 @@ package-release profile="release-musl":
 verify-release-repro profile="release-musl":
     #!/usr/bin/env bash
     set -euo pipefail
-    case "{{profile}}" in
-        release-musl) target=x86_64-unknown-linux-musl ;;
-        release-gnu-tpm) target=x86_64-unknown-linux-gnu ;;
-        *) echo "Unknown release profile: {{profile}}" >&2; exit 1 ;;
-    esac
-    bash scripts/verify-release-repro.sh {{profile}} "target/nix-{{profile}}/$target/release/rescile-vault"
+    if [[ "{{profile}}" != release-musl ]]; then
+        echo "Unknown release profile: {{profile}}" >&2; exit 1
+    fi
+    bash scripts/verify-release-repro.sh release-musl "target/nix-release-musl/$(uname -m)-unknown-linux-musl/release/rescile-vault"
 
 build-static: (build-release "release-musl")
 
-build-gnu-tpm: (build-release "release-gnu-tpm")
+# Run frontend build, Rust formatting, lint and tests before committing.
+rust-check:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    npm ci --prefix ui --no-audit --no-fund
+    npm run build --prefix ui
+    cargo fmt --all -- --check
+    SKIP_FRONTEND_BUILD=1 cargo clippy --locked --all-targets -- -D warnings
+    SKIP_FRONTEND_BUILD=1 cargo test --locked
 
 # Check Rust formatting
 fmt:
