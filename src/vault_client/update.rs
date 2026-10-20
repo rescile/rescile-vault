@@ -24,6 +24,14 @@ struct GithubAsset {
     browser_download_url: String,
 }
 
+fn release_asset_name(os: &str, arch: &str) -> Option<&'static str> {
+    match (os, arch) {
+        ("linux", "x86_64") => Some("rescile-vault-linux-amd64"),
+        ("linux", "aarch64") => Some("rescile-vault-linux-arm64"),
+        _ => None,
+    }
+}
+
 pub fn handle_update(args: UpdateArgs, exe_name: &str) -> Result<(), Box<dyn std::error::Error>> {
     const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
     const USER_AGENT: &str = "rescile-updater";
@@ -31,21 +39,13 @@ pub fn handle_update(args: UpdateArgs, exe_name: &str) -> Result<(), Box<dyn std
     let os = std::env::consts::OS;
     let arch = std::env::consts::ARCH;
 
-    if os != "linux" || arch != "x86_64" {
-        return Err(format!(
-            "Updates are currently only supported for x86_64 Linux. Found OS: {}, ARCH: {}",
-            os, arch
+    let asset_name = release_asset_name(os, arch).ok_or_else(|| {
+        format!(
+            "Updates are only supported for x86_64 and aarch64 Linux. Found OS: {os}, ARCH: {arch}"
         )
-        .into());
-    }
+    })?;
 
     println!("Starting update process...");
-
-    let asset_name = if cfg!(feature = "tpm") {
-        "rescile-vault-x86_64-linux-gnu-tpm"
-    } else {
-        "rescile-vault-x86_64-linux-musl"
-    };
 
     let client = reqwest::blocking::Client::builder()
         .user_agent(USER_AGENT)
@@ -220,4 +220,23 @@ pub fn handle_update(args: UpdateArgs, exe_name: &str) -> Result<(), Box<dyn std
     println!("Update to version '{}' successful!", args.version);
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::release_asset_name;
+
+    #[test]
+    fn release_assets_match_linux_architectures() {
+        assert_eq!(
+            release_asset_name("linux", "x86_64"),
+            Some("rescile-vault-linux-amd64")
+        );
+        assert_eq!(
+            release_asset_name("linux", "aarch64"),
+            Some("rescile-vault-linux-arm64")
+        );
+        assert_eq!(release_asset_name("macos", "aarch64"), None);
+        assert_eq!(release_asset_name("linux", "riscv64"), None);
+    }
 }

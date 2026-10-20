@@ -62,11 +62,12 @@ package-release profile="release-musl":
     fi
     arch=$(uname -m)
     case "$arch" in
-        x86_64|aarch64) ;;
+        x86_64) platform=amd64 ;;
+        aarch64) platform=arm64 ;;
         *) echo "Unsupported release architecture: $arch" >&2; exit 1 ;;
     esac
     binary="target/nix-release-musl/${arch}-unknown-linux-musl/release/rescile-vault"
-    name="rescile-vault-${arch}-linux-musl"
+    name="rescile-vault-linux-${platform}"
     mkdir -p dist
     cp "$binary" "dist/$name"
     (cd dist && sha256sum "$name" > "$name.sha256")

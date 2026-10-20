@@ -31,14 +31,14 @@ asset for your platform:
 
 | Asset | Target | Notes |
 |---|---|---|
-| `rescile-vault-x86_64-linux-musl` | `x86_64-unknown-linux-musl` + `tpm` | Fully static, with TPM 2.0 support. |
-| `rescile-vault-aarch64-linux-musl` | `aarch64-unknown-linux-musl` + `tpm` | Fully static, with TPM 2.0 support. |
+| `rescile-vault-linux-amd64` | `x86_64-unknown-linux-musl` + `tpm` | Fully static, with TPM 2.0 support. |
+| `rescile-vault-linux-arm64` | `aarch64-unknown-linux-musl` + `tpm` | Fully static, with TPM 2.0 support. |
 
 ```sh
 # Replace VERSION with the release you want
 VERSION=v0.1.0
 curl -L -o rescile-vault \
-  "https://github.com/rescile/rescile-vault/releases/download/${VERSION}/rescile-vault-x86_64-linux-musl"
+  "https://github.com/rescile/rescile-vault/releases/download/${VERSION}/rescile-vault-linux-amd64"
 chmod +x rescile-vault
 sudo mv rescile-vault /usr/local/bin/
 ```
