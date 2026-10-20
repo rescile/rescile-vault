@@ -145,54 +145,32 @@ install dest="/usr/local/bin": build-static
 # RELEASE MANAGEMENT
 # ==============================================================================
 
-# Create a new versioned release.
-# This updates Cargo.toml, builds the Nix package, commits the changes, and creates a git tag.
-# Usage: just release <VERSION>
-# Example: just release 0.2.0
+# Prepare a version commit; tag and publish only after the release PR is merged.
 release new_version:
     #!/usr/bin/env bash
     set -euo pipefail
-
-    # --- Variables ---
     NEW_VERSION="{{new_version}}"
-    VERSION_TAG="v{{new_version}}"
+    VERSION_TAG="v${NEW_VERSION}"
 
-    # --- Pre-flight Checks ---
-    if [[ -z "${NEW_VERSION}" ]]; then
-        echo "❌ ERROR: Version argument is mandatory." >&2
-        echo "Usage: just release <VERSION>" >&2
+    if [[ ! "$NEW_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+        echo "Invalid version: $NEW_VERSION (expected X.Y.Z or X.Y.Z-suffix)" >&2
         exit 1
     fi
-    if ! git diff-index --quiet HEAD --; then
-        echo "❌ ERROR: Working directory is not clean. Please commit or stash changes." >&2
+    if [[ -n "$(git status --porcelain)" ]]; then
+        echo 'Working directory is not clean. Commit or stash changes first.' >&2
         exit 1
     fi
-    if git rev-parse "${VERSION_TAG}" >/dev/null 2>&1; then
-        echo "❌ ERROR: Tag '${VERSION_TAG}' already exists." >&2
+    if git rev-parse -q --verify "refs/tags/$VERSION_TAG" >/dev/null; then
+        echo "Tag $VERSION_TAG already exists." >&2
         exit 1
     fi
 
-    echo "==> Releasing version '${VERSION_TAG}'..."
-
-    # Step 1: Update Cargo.toml with the new version
-    echo "    -> Updating Cargo.toml to version ${NEW_VERSION}..."
-    sed -i -E "s/^version = \".*\"/version = \"${NEW_VERSION}\"/" Cargo.toml
-    if [ -f package.nix ]; then
-        echo "    -> Updating package.nix to version ${NEW_VERSION}..."
-        sed -i -E "s/version = \".*\";/version = \"${NEW_VERSION}\";/" package.nix
-    fi
-    cargo update --package {{name}}
-
-    # Step 2: Commit the changes
-    echo "    -> Committing release files..."
-    git add -u Cargo.toml Cargo.lock package.nix || git add -u Cargo.toml Cargo.lock
+    sed -i -E "s/^version = \"[^\"]+\"/version = \"${NEW_VERSION}\"/" Cargo.toml
+    cargo update --package rescile-vault
+    git add -- Cargo.toml Cargo.lock
     git commit -m "Release ${VERSION_TAG}"
 
-    echo
-    echo "✅ Release commit for '${VERSION_TAG}' created successfully!"
-    echo "    Next, push this branch and create a pull request."
-    echo "    After the PR is merged, the release can be finalized by running:"
-    echo "    just mark-release ${NEW_VERSION} <pre|release>"
+    echo "Release commit created. After merge, run: just mark-release ${NEW_VERSION} <pre|release>"
 
 # No standalone vault Nix package exists; Linux binaries are released through flake shells.
 # Retain a clear error for existing callers instead of silently skipping work.
